@@ -12,5 +12,12 @@ template<class T,unsigned N> struct BootstrapPending {
   return Offer::Full;
  }
  Ticket take(unsigned i){if(i>=N)return Ticket{};auto t=entries[i];entries[i]=Ticket{};return t;}
+ bool any()const{for(const auto &e:entries)if(e.display)return true;return false;}
+ // Move ownership out under the queue lock; release objects after unlocking.
+ template<class Stale> unsigned prune(Stale stale,Ticket (&removed)[N]){
+  unsigned count=0;
+  for(unsigned i=0;i<N;i++)if(entries[i].display&&stale(entries[i]))removed[count++]=take(i);
+  return count;
+ }
 };
 }

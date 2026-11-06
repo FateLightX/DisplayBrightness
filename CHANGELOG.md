@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.0.33
+
+- Replace the fixed boot delay with the first observed completed local console login and a registered target display. Register native notifications before reading the current registry snapshot, including preexisting login and late display publication.
+- Keep notification handlers limited to signaling preallocated tasks. Use low-priority, non-reentrant thread calls; no login polling, service restart or timer-based bypass.
+- Dispatch one initial-read visit at a time, with a 50 ms scheduling yield between visits. Retry cooldowns remain per display, allowing other displays to progress.
+- Reclaim inactive/replaced pending tickets before insertion and on termination notifications, including before login. Park admission during slot retirement and resume on completion.
+- Preserve cached early interfaces, rejection of pre-read writes, fresh-read/readback validation and native power checks. Add login observation and DDC framebuffer-lock timing diagnostics.
+- Document upgrades from 0.0.31/0.0.32, package verification and loaded-version checks; remove the obsolete fixed-delay policy and its test.
+- Validation: 29 C++ tests and two source checks, compilation/linking, signature and matching dSYM. New imported symbols were found in the local boot kernel collection. No live boot or startup-performance comparison of 0.0.33 has been observed.
+
+## 0.0.32
+
+- Replace the fixed 50% startup placeholder and three-device fingerprint list with per-display, hardware-verified history in native IOGraphics preferences.
+- Store a versioned, checksummed record containing the exact base EDID and verified current/maximum. Confirm native in-memory acceptance by reading the record back; unchanged values do not request another save.
+- Declare an early interface only from a valid record, while the caller already holds the IOGraphics system gate. An unavailable or invalid cache leaves hardware learning enabled, including when native `doUpdate` returns false.
+- Preserve the 30-second DDC exclusion window, fresh-read readiness gate and rejection of early requests. The plugin never queues a cached value as a hardware target.
+- Commit verified state after releasing bus locks, taking the system gate before the framebuffer gate. Skip obsolete, pending, retired, stopped or replaced endpoints.
+- Validation: 26 C++ tests and two source checks, including production preference, publication and commit functions with test doubles; compilation/linking, ad-hoc signature and matching dSYM.
+- Later read-only observation of UUID `1DF5F5A8-87EA-3659-93B1-69C6826E29D0`: all three displays declared from native cached records at about 6.73 seconds and completed initial hardware reads after 30.05 seconds. This validates the observed restore path, not repeated-boot reliability or UI appearance. First learning may require another boot for native discovery.
+
 ## 0.0.31
 
 - Allow early publication when `IODisplayParameters` does not exist, preserving native parameters and providers.

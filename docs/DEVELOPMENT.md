@@ -4,19 +4,55 @@
 
 `Plugin.cpp` routes IODisplay parameter updates and brightness setters through Lilu. Routing is restricted to Darwin 25.6 and the IOGraphics UUID in the README. Failed compatibility checks leave publication disabled.
 
-For a verified EDID fingerprint, the first pre-registration update declares synthetic `brightness` parameters and the EDM marker. `ParameterPublication.inc` can create a missing dictionary, preserves unrelated parameters and refuses to replace a native brightness provider. The provisional value is 50%.
+When the display has a valid verified-state record, `EarlyDeclaration.inc` declares synthetic `brightness` parameters and the EDM marker before registration. Its initial percentage is derived from that record's current/maximum, including a genuine zero. `ParameterPublication.inc` can create a missing dictionary, preserves unrelated parameters and refuses to replace a native brightness provider. There is no fixed percentage or hardcoded device list.
 
 The property setter returns `kIOReturnNotReady` for synthetic brightness until initialization. Direct integer-set calls are also rejected before taking an additional framebuffer gate. `EndpointRequests.hpp` prevents rejected input from replacing a bootstrap ticket or becoming a later write.
 
-`HardwareWorker.inc` checks the 30-second uptime deadline before framebuffer/bus work. A separate 60-second probe window then governs retries. The first valid VCP 0x10 read replaces the provisional value before the endpoint becomes writable. A brightness property-change message follows; success proves dispatch, not that CoreBrightness refreshed its UI.
+Every eligible update queues hardware learning even if the native update returned false or no cache was available. Admission, hardware workers and the I/O boundary require the first-login permission before additional framebuffer/bus work. Each display's 60-second probe window starts when its worker begins initialization, not while waiting for login. The first valid VCP 0x10 read replaces the historical value before the endpoint becomes writable. A brightness property-change message follows; success proves dispatch, not that CoreBrightness refreshed its UI.
 
 Normal requests coalesce to the latest target. Writes use fresh hardware reads and readback verification. Identity and connection topology are rechecked before I/O. Native framebuffer and queue locking retain their established order.
 
+## Login events and scheduling
+
+`ConsoleLogin.inc` subscribes to `gIOConsoleSecurityInterest` on `IOService::getServiceRoot()` from a background task. Only `kIOMessageConsoleSecurityChange` signals a login check. Because this callback is synchronous in XNU, it only records an atomic notification timestamp/count and signals a preallocated task: no allocations, property access, logging, queue/framebuffer locks or hardware I/O.
+
+The worker reads a retained `IOConsoleUsers` snapshot from **`IORegistryEntry::getRegistryRoot()`**, which differs from the notification provider. A dictionary must contain both `kCGSSessionOnConsoleKey == true` and `kCGSessionLoginDoneKey == true` (the latter has a single `S` in `Session`). Process existence, unlocked-screen state and remote sessions alone do not open the gate. Subscription precedes the first snapshot; display arrivals also request a check while waiting. A missing root is retried on a subsequent route/display event. Failed login or first-publication subscription leaves hardware admission closed with an explicit diagnostic; there is no timed fallback.
+
+`LoginGate.hpp` publishes a one-way atomic permission bit. Lock/unlock notifications cannot restart initialization after the first observed login. This bit does not imply that a display is hardware-ready, powered, connected or safe across sleep/wake. The native I2C path retains its powered/inactive checks; identity and readback validation still run per operation.
+
+`BootstrapAdmission.inc` admits at most one pending display per task invocation. `BootstrapSchedule.hpp` grants only one initial-read visit at a time; retries rejoin the schedule with their own due time, so a failing monitor does not hold a turn throughout its cooldown. Tasks yield with all native locks released; a 50 ms scheduling quantum spaces visits, not a boot-uptime threshold. Repeated update events may advance an existing deadline but cannot postpone it indefinitely. All four thread-call allocation paths use `THREAD_CALL_PRIORITY_LOW` and `THREAD_CALL_OPTIONS_ONCE`, including per-display hardware calls, to prevent concurrent invocation of the same task.
+
+Admission also checks `kIOServiceRegisteredState` before taking a display's framebuffer gate. A pre-registration ticket stays parked without a timer, even if automatic login has already completed. The first-publication notification wakes admission; its handler only signals the existing task. If publication preceded the ticket, the current registration state handles that ordering instead.
+
+Pending tickets retain their display/framebuffer pair. Inactive entries and a display's superseded framebuffer are removed before insertion; references are released after dropping the queue lock. A termination callback signals cleanup, which can run before login without taking a framebuffer gate. If that optional notifier is unavailable, pruning still runs on display arrivals and admission. Admission waits for retiring slots to finish rather than polling for them; retirement cancels queued visits before reuse and wakes admission after freeing a slot.
+
+Nothing waits for a user login on a boot, registration or notification thread. Waiting does not consume retry rounds or arm periodic login timers. DDC work is still synchronous while holding a framebuffer gate, however: lower CPU priority and deferred execution do not prove zero impact on desktop rendering. Optional timing in the DDC `FrameScope` records gate wait and held duration; these properties are published after the gate is released. The measurements do not impose a timeout on an AMD call. A live cold-boot comparison remains required.
+
+Native console notification behavior was checked against [XNU IOService.cpp](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOService.cpp) (`updateConsoleUsers`, `registerInterest`, `applyToInterestNotifiers`). New imported symbols were also found as external definitions in the local boot kernel collection; this is not a load test of 0.0.33.
+
+## Verified history in native preferences
+
+`PreferenceBridge.inc` resolves `IOFramebuffer::copyPreference`, `setPreference` and the native system-workloop/preference readiness globals only after the exact kernel and IOGraphics UUID check. These are private interfaces, so missing symbols disable the cache without enabling a fabricated interface or disabling ordinary hardware learning.
+
+The preference name is `DisplayBrightnessVerifiedState`. Native IOGraphics chooses the per-display bucket through `IODisplayPrefsKey`, which incorporates GPU/display identity and can fall back to a connection-specific key for duplicate EDIDs. The plugin does not build its own paths or write files, NVRAM or user settings. Changed records use IOGraphics' existing delayed preference notification and system persistence path.
+
+`VerifiedBrightness.hpp` defines a single 144-byte `OSData` record: magic, schema version 1, reserved zero bytes, the complete 128-byte EDID base block, 16-bit current and maximum, and CRC32. Multi-byte fields are little-endian. A record must have the exact length/version, valid checksum, matching valid EDID and a nonzero maximum with current at or below it. CRC detects accidental corruption; the record never authorizes a hardware write.
+
+Early reads only proceed when `IOGraphicsWorkLoop::inGate()` says the current thread already owns the system gate. They do not acquire another gate, wait or access DDC. A caller without that gate gets `cache-system-gate-not-held` and continues through login-gated learning. The specified 0.0.32 sample below observed this pre-registration path; 0.0.33 remains untested in a live boot.
+
+After a successful initial read or verified write cycle, `VerifiedPersistence.inc` runs a synchronous action under the system workloop gate. The bus and all framebuffer/queue locks have already been released. The action takes the framebuffer gate, rechecks live topology, EDID and synthetic ownership, then checks readiness, retirement and request sequence under the queue lock. It releases the queue lock before calling the native setter, while the framebuffer gate excludes new submissions for that display. The lock order is system → framebuffer → queue; no system-gate acquisition occurs while a controller or bus lock is held. Retirement waits for the worker before clearing or reusing its slot.
+
+`PreferenceStore.inc` encodes only the worker's verified current/maximum, skips an identical stored record and reads back changed records after native acceptance. A successful setter return alone is insufficient because the native implementation can return true on allocation failure. `accepted-native` and `unchanged-native` prove in-memory equality, not that macOS flushed the record to disk. There is no persistence retry daemon or new polling loop; another verified hardware cycle can attempt a failed save again.
+
+The cache seeds the interface only. It does not mark an endpoint writable, change a bootstrap ticket, enqueue a brightness request or restore monitor hardware. A monitor-menu change or another OS may make the historical value stale; the next hardware read corrects it. Without a valid record, the first learning boot may still miss native capability discovery. The next boot can use the learned record only if macOS retained it and loaded preferences before discovery. See the [two-boot procedure](TROUBLESHOOTING.md#verify-learning-and-restoration).
+
+Native implementation references: Apple's [IOFramebuffer.cpp](https://github.com/apple-oss-distributions/IOGraphics/blob/main/IOGraphicsFamily/IOFramebuffer.cpp) (`copyPreference`, `setPreference`, `writePrefs`, `IOFramebufferLockedSerialize`, `IOGraphicsWorkLoop::closeGate`) and [IODisplay.cpp](https://github.com/apple-oss-distributions/IOGraphics/blob/main/IOGraphicsFamily/IODisplay.cpp) (`loadPrefs`, `start`). Required symbols were also found in the UUID-matched local kernel collection; this does not substitute for running the new integration.
+
 ## Compatibility scope
 
-Generic read-only probing accepts valid external-display EDIDs. Early declaration is narrower: `EarlyDisplayProfiles.hpp` contains three previously verified base-block fingerprints. A fingerprint is an identity hint, not permission to write; hardware validation remains mandatory. Another unit of the same model may not match.
+Generic read-only probing accepts valid external-display EDIDs. Early declaration requires a valid record for that native display preference bucket and exact base EDID. A new monitor, changed identity or a changed native preference key may need another learning boot. Hardware validation remains mandatory on every boot.
 
-The startup delay is not a GPU-ready signal or a hard timeout. A synchronous AMD I2C request can still block.
+The first-login permission is not a GPU-ready signal or a hard timeout. A synchronous AMD I2C request can still block. Before the first login, controls declared from history remain unwritable. Automatic login may occur early, so its timing and performance require separate measurement.
 
 CoreBrightness may cache capabilities during device construction. Ordinary value-change notifications are not established as capability rediscovery. Initialization errors may affect whether the system retains a control; later system retries cannot reliably be distinguished from new user input.
 
@@ -24,19 +60,41 @@ CoreBrightness may cache capabilities during device construction. Ordinary value
 
 Run `python3 driver/test.py` from the repository root.
 
-The suite contains 25 C++ programs and two source checks. It covers packets, read recovery, coalescing, endpoint retirement/reuse, identity/topology, startup timing, state synchronization and publication ownership.
+The suite contains 29 C++ programs and two source checks. It covers packets, read recovery, coalescing, endpoint retirement/reuse, identity/topology, login admission, scheduling, state synchronization, publication ownership and verified history.
 
-The publication regression harness executes the same implementation included by the kext, using reference-counted registry doubles. It tests missing dictionaries, true zero, native data preservation and failure cleanup. It reproduces the missing-dictionary rejection in 0.0.30, but does not prove which branch ran during that historical boot.
+The publication and preference harnesses execute the implementations included by the kext, using reference-counted registry and native-preference doubles. They test missing dictionaries/cache records, real zero, unchanged saves, allocation failures, false native acceptance, native owner preservation and no early cache replay. The actual commit callback is exercised with gate assertions and stale, pending, retired, stopped and replaced endpoints. Codec tests reject bit corruption, unknown schemas, bad ranges and changed EDID identity. Source checks verify the kernel wiring and lock acquisition order; they do not exercise real kernel scheduling.
 
-Public fixtures use synthetic or serial-redacted EDIDs. Known-profile membership and fingerprint calculation are tested separately so raw device serial data need not be published.
+The console and admission harnesses also execute production functions. They cover the two distinct roots, exact session flags, existing login, notification during registration, late root availability, failed subscription, signal-only callbacks, pre-login cleanup, full-queue replacement, arrivals while a visit runs, independent cooldowns, retirement parking and balanced references. The kernel source checks enforce login gating at each boundary and non-reentrant task allocation. Test doubles do not reproduce real notification scheduling or graphics-lock contention.
 
-The build script compiles and links x86_64 kernel code, generates dSYM, applies an ad-hoc signature and validates the bundle and ZIP. The local manifest records source/archive hashes and toolchain paths. Build output is ignored by Git.
+Public fixtures use synthetic or serial-redacted EDIDs. Actual cache records contain the device's base EDID locally; reports need only the diagnostic fields, not raw preference records or full registry dumps.
 
-These checks do not exercise a running kernel, DDC transport, native UI, cold boot, sleep/wake or hot-plug. See [runtime checks](TROUBLESHOOTING.md).
+These checks do not exercise a running kernel, DDC transport, native persistence, UI, cold boot, sleep/wake or hot-plug. No live boot of 0.0.33 has been observed. See [runtime checks](TROUBLESHOOTING.md).
+
+### Build artifacts
+
+The build script compiles and links x86_64 kernel code, generates dSYM, applies an ad-hoc signature and validates the bundle and ZIP. Rebuilding replaces the current version's bundle, symbols, ZIP and manifest. Compiler intermediates use a temporary staging directory that is removed when the build exits.
+
+From the repository root, check the resulting package:
+
+```sh
+codesign --verify --strict build/0.0.33/DisplayBrightness.kext
+xcrun dwarfdump --uuid build/0.0.33/DisplayBrightness.kext/Contents/MacOS/DisplayBrightness build/0.0.33/DisplayBrightness.kext.dSYM
+shasum -a 256 build/0.0.33/DisplayBrightness-0.0.33-DEBUG.zip
+```
+
+The binary and dSYM must have the same x86_64 UUID. The ZIP SHA256 must match `archive_sha256` in `build/0.0.33/build-manifest.json`. This local manifest also records source hashes and toolchain paths; it is not included in the ZIP. The ZIP contains the kext, matching symbols, both READMEs, changelog, license and design/troubleshooting guides. Build output is ignored by Git.
+
+Old version directories and the optional compiled `build/display-api-status` tool can be removed after preserving any needed rollback packages outside the repository. Keep symbols with their matching binary when archiving a build. Git tracks the diagnostic source, not its executable or local logs.
 
 ## Observed runtime sample
 
+A read-only inspection of 0.0.32, UUID `1DF5F5A8-87EA-3659-93B1-69C6826E29D0`, found all three displays declared from valid native preference records at approximately 6.729 seconds of uptime. The first DDC visits began at 30.052–30.055 seconds and completed by 30.192 seconds. Individual initial reads took 46.433, 45.886 and 47.274 ms. All three endpoints were `hardware-ready`, with hardware and cached current/maximum at 100/100. This is evidence for cached early restoration in that boot, not the new login gate, visible controls or startup-performance equivalence. The original login transition time was not captured.
+
+### Earlier 0.0.31 sample
+
 A local 0.0.31 build, UUID `774A9B08-C844-3059-854C-6A95B93A1F61`, was inspected on Darwin 25.6 with Lilu 1.7.3. Match UUIDs as well as versions when comparing builds; a rebuilt package is not automatically the same tested binary.
+
+This is historical evidence for 0.0.31's publication path. That version used a fixed placeholder and did not create verified-state cache records; the observations below do not validate 0.0.32's preference integration.
 
 | Display | Early declaration | Native API | Hardware state |
 | --- | --- | --- | --- |

@@ -4,7 +4,7 @@
 #include <initializer_list>
 int main(){
  dbhw::EndpointRequests r;bool schedule=true;
- // A visible provisional slider can cause an automatic zero restore. Neither
+ // A visible cached slider can cause an automatic zero restore. Neither
  // that nor an early drag may start work or mutate the bootstrap target.
  for(unsigned value:{0U,20U,50U,100U}){
   assert(!r.submitBrightness(value,schedule));assert(!schedule);

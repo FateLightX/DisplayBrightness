@@ -17,7 +17,7 @@ bool publish(IOService *s,bool haveSeed,UInt32 seed){
  }
  OSObject *current=old->getObject("brightness");
  if(current){
-  // A real first read must replace our provisional value. Never touch a native
+  // A real first read must replace our cached value. Never touch a native
   // provider, even when a stale synthetic owner remains in the registry.
   auto *range=OSDynamicCast(OSDictionary,owned);
   auto *n=range?OSDynamicCast(OSNumber,range->getObject("value")):nullptr;

@@ -4,7 +4,7 @@
 
 An experimental Lilu plugin that exposes external-monitor brightness through macOS display parameters and DDC/CI VCP 0x10.
 
-**Current version: 0.0.31. One local startup has verified early declaration, native brightness APIs and hardware brightness state on three DisplayPort monitors.** UI appearance, repeated cold-boot stability, sleep/wake and hot-plug still need validation. See the [runtime sample](docs/DEVELOPMENT.md#observed-runtime-sample) for the exact tested build.
+**Current version: 0.0.33, a test build that starts DDC after the first completed local login instead of a fixed 30-second delay.** Local tests and build checks pass; this version has not been boot-tested. Login-event timing and startup performance need hardware validation. Verified-history restoration was observed in the specified [0.0.32 runtime sample](docs/DEVELOPMENT.md#observed-runtime-sample); that does not validate the new scheduler.
 
 ## Requirements
 
@@ -21,13 +21,15 @@ These are intentional ABI limits. Other OS builds, GPUs, adapters, sleep/wake an
 ## Behavior
 
 - Starts automatically with Lilu; `-dboff` disables the plugin.
-- Declares an interface before display registration for three verified **EDID base-block fingerprints**, belonging to U2790B, U28P2G6B and U2701B units. Another unit of the same model may not match.
-- Uses 50% only as a provisional UI value. Writes are rejected and discarded until the first valid hardware read.
-- Defers DDC until at least 30 seconds of uptime, then probes for up to 60 seconds. The first valid read replaces the provisional value and enables requests.
+- Uses the display's last hardware-verified brightness to declare its interface before registration, when a valid native preference record is available. There is no fixed initial percentage or model allowlist.
+- Saves one versioned record in macOS IOGraphics preferences after a successful hardware read or verified write. The record binds the value and hardware maximum to the exact base EDID and native display preference key.
+- With no valid record, learns from hardware after login. **The first learning boot may have no native slider; early discovery can be tested on the next boot after the record is retained.**
+- Watches the kernel's console-session notification and checks a current snapshot after subscribing. DDC admission requires both an observed completed local console login and a registered display; there is no elapsed-time override or periodic login polling.
+- Probes one display per background visit, yielding between visits. Each display keeps its own bounded retry window; time spent waiting for login does not consume it. A fresh read replaces the historical value before requests are enabled. Earlier requests are discarded; cached values never enter the hardware request queue.
 - Rechecks identity, topology and the hardware range before writes, and verifies the result by reading it back.
-- Probes other valid external-display EDIDs without a model allowlist, publishing only after a valid read. Native slider discovery after that late publication remains unresolved.
+- Preserves an existing native brightness provider. Invalid, unavailable or mismatched records fall back to hardware learning without a fabricated value.
 
-The delay is a startup exclusion window, not proof that the GPU is ready or a timeout for an in-flight AMD call. No background helper or launch daemon is required.
+The login callback only signals a preallocated task; it never waits for hardware. Low-priority DDC work still acquires graphics locks, so asynchronous execution does not prove zero startup overhead. Login completion is not proof that the GPU is ready and cannot time out an in-flight AMD call. The cached value is historical: monitor-menu changes or another OS can make it differ from current hardware. No background helper or launch daemon is required. See [startup verification](docs/TROUBLESHOOTING.md#verify-login-gating-and-startup-performance).
 
 ## Build
 
@@ -38,7 +40,7 @@ python3 driver/test.py
 python3 driver/build.py --lilu /path/to/Lilu.kext --sdk /path/to/MacKernelSDK
 ```
 
-Output in `build/0.0.31/`: kext, matching dSYM, `DisplayBrightness-0.0.31-DEBUG.zip` and a build manifest. Building does not install or load the driver.
+Output in `build/0.0.33/`: kext, matching dSYM, `DisplayBrightness-0.0.33-DEBUG.zip` and a build manifest. The ZIP includes both language READMEs and the design/troubleshooting guides. Building does not install or load the driver. See [artifact verification](docs/DEVELOPMENT.md#build-artifacts) for signature, UUID and checksum checks.
 
 ## Install or roll back
 
@@ -49,11 +51,20 @@ Output in `build/0.0.31/`: kext, matching dSYM, `DisplayBrightness-0.0.31-DEBUG.
 
 To roll back, restore the previous kext or disable its entry. Adding `-dboff` to existing boot arguments also disables it after reboot; preserve unrelated arguments.
 
+### Upgrading to 0.0.33
+
+| Previous version | Expected behavior |
+| --- | --- |
+| 0.0.31 or earlier | No verified-history record from this feature. Complete a local login to learn the hardware value; native sliders may need the next boot. |
+| 0.0.32 | Reuses valid verified-history records. The first login and display registration replace the fixed 30-second DDC gate. |
+
+Replace the existing bundle once and confirm the loaded version after reboot. No cache reset, new boot argument or login helper is needed. Before login, a cached interface can exist, but hardware reads and writes remain gated.
+
 A loaded kext or successful DDC read alone does not prove native sliders work. See [troubleshooting](docs/TROUBLESHOOTING.md).
 
 ## Development
 
-Current validation covers **25 C++ tests and two source checks**, compilation/linking, ad-hoc signing and matching debug symbols. It does not substitute for a real boot or display-control test.
+Current validation covers **29 C++ tests and two source checks**, compilation/linking, ad-hoc signing and matching debug symbols. It does not substitute for a real boot, startup-performance, persistence or display-control test.
 
 - [Design and test scope](docs/DEVELOPMENT.md)
 - [Version history](CHANGELOG.md)

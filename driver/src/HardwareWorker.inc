@@ -17,55 +17,8 @@ HardwareSlot hardwareSlots[dbcompat::endpointCapacity];
 IOLock *hardwareQueue=nullptr;
 bool hardwareRequested=false;
 thread_call_t retireCall=nullptr,admissionCall=nullptr;
-dbstate::BootstrapPending<IOService,dbcompat::endpointCapacity> pendingBootstrap;
 bool queueHardware(IOService *,IOService *,UInt32,bool);
-unsigned startupRemainingMs(){
- UInt64 now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);
- return dbstate::StartupDelay::remainingMs(ns);
-}
-void scheduleAdmission(){
- unsigned delay=startupRemainingMs();if(delay<50)delay=50;
- uint64_t deadline;clock_interval_to_deadline(delay,kMillisecondScale,&deadline);
- thread_call_enter_delayed(admissionCall,deadline);
-}
-void admissionWorker(thread_call_param_t,thread_call_param_t){
- // Retirement retries also use this worker. Check before taking tickets or
- // acquiring any framebuffer gate, even if another path scheduled us early.
- if(startupRemainingMs()){scheduleAdmission();return;}
- for(unsigned i=0;i<dbcompat::endpointCapacity;i++){
-  IOLockLock(hardwareQueue);auto ticket=pendingBootstrap.take(i);IOLockUnlock(hardwareQueue);
-  if(!ticket.display)continue;
-  {
-   FrameScope gate(ticket.display);
-   if(gate.valid(ticket.display)&&gate.frameService==ticket.frame){
-    publish(ticket.display,false,0);publishEDMMarker(ticket.display);
-    queueHardware(ticket.display,ticket.frame,0,true);
-   }
-  }
-  ticket.frame->release();ticket.display->release();
- }
-}
-// hardwareQueue held. Existing tickets already own their reference pair.
-bool rememberBootstrap(IOService *s,IOService *fb){
- auto result=pendingBootstrap.offer(s,fb);
- if(result==dbstate::Offer::Inserted){s->retain();fb->retain();}
- return result!=dbstate::Offer::Full;
-}
-bool queueBootstrap(IOService *s){
- if(!hardwareRequested || !hardwareQueue || !admissionCall || !startIO)return false;
- // Copy topology references without acquiring a framebuffer gate in doUpdate.
- auto *connection=s->copyParentEntry(gIOServicePlane);
- auto *parent=connection?connection->copyParentEntry(gIOServicePlane):nullptr;
- auto *fb=OSDynamicCast(IOService,parent);
- bool queued=false;
- if(hasClass(connection,"IODisplayConnect") && hasClass(fb,"IOFramebuffer") && !fb->isInactive()){
-  IOLockLock(hardwareQueue);queued=rememberBootstrap(s,fb);IOLockUnlock(hardwareQueue);
- }
- if(parent)parent->release();if(connection)connection->release();
- if(queued)scheduleAdmission();
- else s->setProperty("DisplayBrightnessBootstrapState","admission-unavailable");
- return queued;
-}
+#include "BootstrapAdmission.inc"
 
 void retireWorker(thread_call_param_t,thread_call_param_t){
  // Runs independently of framebuffer gates. Retiring slots cannot accept work.
@@ -87,10 +40,13 @@ void retireWorker(thread_call_param_t,thread_call_param_t){
   c.requests=dbhw::EndpointRequests{};c.haveOriginal=false;c.terminal=false;
   c.sequence=0;c.verifiedCurrent=0;c.verifiedMaximum=0;
   c.haveNotified=false;c.lastNotifiedPercent=0;c.superseded=false;
+  bootstrapTurns.cancel(slotIndex(&c));
   // Keep the completed thread_call object stable for reuse; never free in flight.
   c.retiring=false;c.reclaiming=false;
+  admissionWaitingForRetirement=false;
   IOLockUnlock(hardwareQueue);
   if(interface)interface->release();if(connection)connection->release();if(frame)frame->release();if(display)display->release();
+  scheduleAdmission();
  }
 }
 
@@ -102,7 +58,7 @@ bool ownedEndpoint(IOService *s){
  if(o)o->release();if(p)p->release();return ok;
 }
 bool endpointReady(IOService *s){
- if(!hardwareQueue)return false;
+ if(!hardwareQueue||!loginGate.allowed())return false;
  bool ready=false;
  IOLockLock(hardwareQueue);
  for(const auto &c:hardwareSlots)
@@ -140,27 +96,36 @@ bool hardwareLive(HardwareSlot *c,FrameScope &gate,bool bootstrapRead=false){
 }
 // The caller holds bus serialization; scope releases native gate after each IO.
 bool hardwareIO(HardwareSlot *c,IOI2CRequest &q,const char *operation){
- FrameScope gate(c->display);
- if(!hardwareLive(c,gate,!strcmp(operation,"get-initial-brightness"))){
-  c->terminal=true;
-  c->display->setProperty("DisplayBrightnessHardwareState","offline-or-replaced");return false;
- }
- if(!c->requests.initialized){
-  UInt64 now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);
-  if(!c->bootstrapWindow.within(ns)){
-   c->terminal=true;c->bootAttempt.phase=dbstate::BootstrapPhase::Exhausted;
-   c->display->setProperty("DisplayBrightnessBootstrapState","probe-window-exhausted-reconnect-required");return false;
+ if(!loginGate.allowed())return false;
+ FrameTiming timing;
+ bool succeeded=[&](){
+  FrameScope gate(c->display,&timing);
+  if(!hardwareLive(c,gate,!strcmp(operation,"get-initial-brightness"))){
+   c->terminal=true;
+   c->display->setProperty("DisplayBrightnessHardwareState","offline-or-replaced");return false;
   }
- }
- IOReturn status=startIO(c->interface,&q);
- if(!c->requests.initialized){c->bootAttempt.attempted=true;c->bootAttempt.transport=static_cast<UInt32>(status);c->bootAttempt.request=static_cast<UInt32>(q.result);}
- c->display->setProperty("DisplayBrightnessHardwareOperation",operation);
- c->display->setProperty("DisplayBrightnessHardwareTransportResult",static_cast<UInt32>(status),32);
- c->display->setProperty("DisplayBrightnessHardwareRequestResult",static_cast<UInt32>(q.result),32);
- if(status!=kIOReturnSuccess || q.result!=kIOReturnSuccess){
-  c->display->setProperty("DisplayBrightnessHardwareState","transport-error-stopped");return false;
- }
- return true;
+  if(!c->requests.initialized){
+   UInt64 now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);
+   if(!c->bootstrapWindow.within(ns)){
+    c->terminal=true;c->bootAttempt.phase=dbstate::BootstrapPhase::Exhausted;
+    c->display->setProperty("DisplayBrightnessBootstrapState","probe-window-exhausted-reconnect-required");return false;
+   }
+  }
+  IOReturn status=startIO(c->interface,&q);
+  if(!c->requests.initialized){c->bootAttempt.attempted=true;c->bootAttempt.transport=static_cast<UInt32>(status);c->bootAttempt.request=static_cast<UInt32>(q.result);}
+  c->display->setProperty("DisplayBrightnessHardwareOperation",operation);
+  c->display->setProperty("DisplayBrightnessHardwareTransportResult",static_cast<UInt32>(status),32);
+  c->display->setProperty("DisplayBrightnessHardwareRequestResult",static_cast<UInt32>(q.result),32);
+  if(status!=kIOReturnSuccess || q.result!=kIOReturnSuccess){
+   c->display->setProperty("DisplayBrightnessHardwareState","transport-error-stopped");return false;
+  }
+  return true;
+ }();
+ // Publish measurements after the native gate has been released. A duration is
+ // observational; it cannot interrupt a synchronous vendor-driver request.
+ c->display->setProperty("DisplayBrightnessDDCFrameWaitMicroseconds",timing.waitNs/1000,64);
+ c->display->setProperty("DisplayBrightnessDDCFrameHeldMicroseconds",timing.heldNs/1000,64);
+ return succeeded;
 }
 bool hardwareReadOnce(HardwareSlot *c,dbddc::Brightness &b,const char *operation){
  if(!c->requests.initialized){++c->bootAttempt.reads;c->bootAttempt.replyValid=false;}
@@ -333,6 +298,7 @@ void syncVerifiedState(HardwareSlot *c,UInt64 sequence){
   c->display->setProperty("DisplayBrightnessStateSyncMessageResult",static_cast<UInt32>(status),32);
  }
 }
+#include "VerifiedPersistence.inc"
 // Startup-only diagnostics: bounded history, emitted after releasing the bus.
 void recordBootstrapAttempt(HardwareSlot *c,bool ok,UInt64 started,UInt64 finished){
  absolutetime_to_nanoseconds(started,&c->bootAttempt.startedNs);
@@ -356,13 +322,10 @@ void recordBootstrapAttempt(HardwareSlot *c,bool ok,UInt64 started,UInt64 finish
 }
 void hardwareWorker(thread_call_param_t arg,thread_call_param_t){
  auto *c=static_cast<HardwareSlot *>(arg);
- // Preserve the pending request and the full probe budget while deferred.
- // No native gate, bus lock or synchronous AMD call before the boot deadline.
- if(unsigned delay=startupRemainingMs()){
-  uint64_t deadline;clock_interval_to_deadline(delay,kMillisecondScale,&deadline);
-  thread_call_enter_delayed(c->call,deadline);return;
- }
+ // Neither request consumption nor the probe budget begins while waiting for login.
+ if(!loginGate.allowed())return;
  IOLockLock(hardwareQueue);
+ if(!c->requests.initialized&&bootstrapTurns.active!=slotIndex(c)){IOLockUnlock(hardwareQueue);return;}
  UInt32 desired=c->requests.take();UInt64 sequence=c->sequence;bool initialized=c->requests.initialized;
  IOLockUnlock(hardwareQueue);
  if(initialized)c->display->setProperty("DisplayBrightnessHardwareDesired",desired,32);
@@ -388,7 +351,7 @@ void hardwareWorker(thread_call_param_t arg,thread_call_param_t){
  if(!initialized&&bootAllowed)recordBootstrapAttempt(c,ok,started,finished);
  c->display->setProperty("DisplayBrightnessHardwareCycleMicroseconds",elapsed/1000,64);
  c->display->setProperty("DisplayBrightnessHardwareCycleSequence",sequence,64);
- if(ok)syncVerifiedState(c,sequence);
+ if(ok){syncVerifiedState(c,sequence);persistVerifiedState(c,sequence);}
  // Deadline bounds new startup attempts, not an in-flight synchronous AMD call.
  UInt64 finishedNs=0;absolutetime_to_nanoseconds(finished,&finishedNs);
  if(!initialized&&!ok&&!c->terminal&&!c->bootstrapWindow.maySchedule(finishedNs)){
@@ -402,11 +365,15 @@ void hardwareWorker(thread_call_param_t arg,thread_call_param_t){
  bool yielded=c->superseded&&live;
  if(yielded)c->display->setProperty("DisplayBrightnessHardwareState","superseded-unverified");
  if(live && c->requests.complete(ok||yielded)){
-  uint64_t deadline;clock_interval_to_deadline((ok||yielded)?50:(initialized?2000:dbstate::BootstrapWindow::intervalMs),kMillisecondScale,&deadline);
   if(!ok&&!yielded)c->display->setProperty("DisplayBrightnessHardwareState",initialized?"recovering-read-before-write":"probe-cooldown");
-  thread_call_enter_delayed(c->call,deadline);
+  if(c->requests.initialized){
+   uint64_t deadline;clock_interval_to_deadline((ok||yielded)?50:2000,kMillisecondScale,&deadline);
+   thread_call_enter_delayed(c->call,deadline);
+  }else bootstrapTurns.offer(slotIndex(c),uptimeNanoseconds()+static_cast<UInt64>(dbstate::BootstrapWindow::intervalMs)*1000000ULL);
  }
+ if(!initialized)bootstrapTurns.finish(slotIndex(c),uptimeNanoseconds());
  IOLockUnlock(hardwareQueue);
+ if(!initialized)scheduleAdmission();
 }
 void endpointSnapshot(IOService *s,const char *reason,unsigned interfaces){
  // Caller holds hardwareQueue; snapshots carry registry IDs, never kernel pointers.
@@ -437,16 +404,17 @@ void endpointSnapshot(IOService *s,const char *reason,unsigned interfaces){
 bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=false){
  // Called inside the native gate; no bus operations here.
  if(!hardwarePilot(s))return false;
- if(!hardwareRequested || !startIO || !probeSerial || !hardwareQueue || desired>100)return false;
+ if(!hardwareRequested || !startIO || !probeSerial || !hardwareQueue || desired>100||!loginGate.allowed())return false;
  IOLockLock(hardwareQueue);
  HardwareSlot *slot=nullptr,*empty=nullptr;
- const char *reason="slots-full";unsigned interfaceCount=0;bool retireNeeded=false;
+ const char *reason="slots-full";unsigned interfaceCount=0;bool retireNeeded=false,retirementPending=false;
  for(auto &candidate:hardwareSlots){
   if(retireCall && dbhw::canRetire(candidate.display!=nullptr,candidate.display && candidate.display->isInactive(),candidate.requests.busy,candidate.retiring)){
    candidate.retiring=true;retireNeeded=true;
   }
   if(!candidate.retiring && candidate.display==s)slot=&candidate;
   if(!candidate.retiring && !candidate.display && !empty)empty=&candidate;
+  retirementPending|=candidate.retiring;
  }
  if(!slot && empty && bootstrap){
   IOService *iface=nullptr;unsigned count=0;
@@ -464,7 +432,7 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
   if(n && count==1)reason=supported?"thread-call-allocation-failed":"unsupported-transaction";
   if(types)types->release();
   if(supported || bootstrap){
-   if(!empty->call)empty->call=thread_call_allocate_with_priority(hardwareWorker,empty,THREAD_CALL_PRIORITY_LOW);
+   if(!empty->call)empty->call=thread_call_allocate_with_options(hardwareWorker,empty,THREAD_CALL_PRIORITY_LOW,THREAD_CALL_OPTIONS_ONCE);
    if(empty->call && captureEndpointEDID(s,empty->boundEDID)){
     auto *connection=s->copyParentEntry(gIOServicePlane);
     auto *parent=connection?connection->copyParentEntry(gIOServicePlane):nullptr;
@@ -488,14 +456,18 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
  if(ok){
   slot->sequence=nextEvent();
   if(schedule){
-   uint64_t deadline;clock_interval_to_deadline(50,kMillisecondScale,&deadline);
-   thread_call_enter_delayed(slot->call,deadline);
+   if(bootstrap)bootstrapTurns.offer(slotIndex(slot),uptimeNanoseconds());
+   else{
+    uint64_t deadline;clock_interval_to_deadline(50,kMillisecondScale,&deadline);
+    thread_call_enter_delayed(slot->call,deadline);
+   }
   }
  }
  bool retryAdmission=false;
  // A full set of active slots must not create an endless admission poll.
- if(!slot && bootstrap && admissionCall && retireNeeded){
+ if(!slot && bootstrap && admissionCall && retirementPending){
   retryAdmission=rememberBootstrap(s,fb);
+  admissionWaitingForRetirement=retryAdmission;
   reason=retryAdmission?"bootstrap-admission-queued":"bootstrap-pending-full";
  }
  if(!slot && retireNeeded && !bootstrap)reason="retirement-queued-retry-request";
@@ -503,7 +475,7 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
  if(!ok)s->setProperty("DisplayBrightnessEndpointFailure",reason);
  IOLockUnlock(hardwareQueue);
  if(retireNeeded)thread_call_enter(retireCall);
- if(retryAdmission){uint64_t deadline;clock_interval_to_deadline(2000,kMillisecondScale,&deadline);thread_call_enter_delayed(admissionCall,deadline);}
+ if((bootstrap&&ok&&schedule)||retryAdmission)scheduleAdmission();
  if(!slot)s->setProperty("DisplayBrightnessHardwareState","no-unambiguous-endpoint-or-slot");
  return ok;
 }

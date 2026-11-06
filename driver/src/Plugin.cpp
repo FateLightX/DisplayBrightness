@@ -18,10 +18,13 @@
 #include "BootstrapJournal.hpp"
 #include "BootstrapWindow.hpp"
 #include "BootstrapPending.hpp"
-#include "StartupDelay.hpp"
-#include "EarlyDisplayProfiles.hpp"
+#include "LoginGate.hpp"
+#include "BootstrapSchedule.hpp"
+#include "VerifiedBrightness.hpp"
 #include "EndpointRequests.hpp"
 #include <IOKit/IOMessage.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/i2c/IOI2CInterface.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>
@@ -102,18 +105,22 @@ IOReturn properties(IOService *s,OSObject *input){
  if(brightnessPresent)record(s,"DisplayBrightnessBrightnessPropertyExit",seq,waiting?"rejected-not-ready":"exit",nullptr,hasValue,value,static_cast<UInt32>(result));
  return result;
 }
+struct FrameTiming {UInt64 waitNs=0,heldNs=0;};
 struct FrameScope {
  IORegistryEntry *connection=nullptr,*frame=nullptr;
  IOService *frameService=nullptr;
  bool locked=false;
- explicit FrameScope(IOService *s){
+ FrameTiming *timing=nullptr;UInt64 acquiredTicks=0;
+ explicit FrameScope(IOService *s,FrameTiming *measurement=nullptr):timing(measurement){
   connection=s->copyParentEntry(gIOServicePlane);
   if(!hasClass(connection,"IODisplayConnect"))return;
   frame=connection->copyParentEntry(gIOServicePlane);
   if(!hasClass(frame,"IOFramebuffer"))return;
   frameService=OSDynamicCast(IOService,frame);
   if(!frameService || frameService->isInactive())return;
+  UInt64 began=0;if(timing)clock_get_uptime(&began);
   frameLock(frameService);locked=true;
+  if(timing){clock_get_uptime(&acquiredTicks);absolutetime_to_nanoseconds(acquiredTicks-began,&timing->waitNs);}
  }
  bool validTopology(IOService *s){
   if(!locked || !s || s->isInactive() || frameService->isInactive() || strcmp(s->getMetaClass()->getClassName(),"AppleDisplay"))return false;
@@ -124,12 +131,17 @@ struct FrameScope {
  }
  bool valid(IOService *s){return validTopology(s)&&pilot(s);}
  ~FrameScope(){
-  if(locked)frameUnlock(frameService);
+  if(locked){
+   if(timing){UInt64 end=0;clock_get_uptime(&end);absolutetime_to_nanoseconds(end-acquiredTicks,&timing->heldNs);}
+   frameUnlock(frameService);
+  }
   if(frame)frame->release();if(connection)connection->release();
  }
 };
 bool publish(IOService *,bool,UInt32);
 void publishEDMMarker(IOService *);
+#include "PreferenceBridge.inc"
+#include "ConsoleLogin.inc"
 #include "HardwareWorker.inc"
 #include "ParameterPublication.inc"
 void publishEDMMarker(IOService *s){
@@ -171,28 +183,7 @@ void publishEDMMarker(IOService *s){
  data->release();
  s->setProperty("DisplayBrightnessEDMProbeState",ok?"marker-published-synthetic":"publication-failed");
 }
-void earlyDeclarationReason(IOService *s,const char *reason){
- if(!s->getProperty("DisplayBrightnessEarlyDeclarationFirstReason"))
-  s->setProperty("DisplayBrightnessEarlyDeclarationFirstReason",reason);
- s->setProperty("DisplayBrightnessEarlyDeclarationLastReason",reason);
-}
-void declareEarlyEndpoint(IOService *s){
- // IODisplay::start calls doUpdate before displayOnline/registerService. After
- // registration, all parameter publication remains on the deferred worker.
- if(!hardwareRequested || !startIO || !admissionCall){earlyDeclarationReason(s,"workers-unavailable");return;}
- if(s->getState()&kIOServiceRegisteredState){earlyDeclarationReason(s,"already-registered");return;}
- if(ownedEndpoint(s)){earlyDeclarationReason(s,"already-owned");return;}
- auto *p=s->copyProperty("IODisplayEDID");auto *edid=OSDynamicCast(OSData,p);
- bool known=edid && dbstate::earlyDisplay(static_cast<const UInt8 *>(edid->getBytesNoCopy()),edid->getLength());
- if(p)p->release();if(!known){earlyDeclarationReason(s,"unverified-edid");return;}
- if(!publish(s,true,dbstate::provisionalBrightness)){earlyDeclarationReason(s,"parameter-publication-failed");return;}
- publishEDMMarker(s);
- UInt64 now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);
- s->setProperty("DisplayBrightnessEarlyDeclarationUptimeNs",ns,64);
- s->setProperty("DisplayBrightnessInterfaceState","pending-hardware");
- s->setProperty("DisplayBrightnessProvisionalPercent",dbstate::provisionalBrightness,32);
- earlyDeclarationReason(s,"declared");
-}
+#include "EarlyDeclaration.inc"
 bool update(IOService *s){
  bool observed=pilot(s);bool parametersBefore=false;
  if(observed){
@@ -216,11 +207,11 @@ bool update(IOService *s){
   IOLog("DisplayBrightness: update display=%llu original=%d\n",s->getRegistryEntryID(),ok);
   if(enabled()){
    // Only the pre-registration declaration is synchronous. Hardware admission,
-   // additional framebuffer gates and all DDC stay on the delayed worker.
+   // additional framebuffer gates and all DDC stay on the background worker.
    declareEarlyEndpoint(s);
-   // Upstream parameter handlers can return false while the service continues
-   // to start. That does not prevent our separate, known endpoint declaration.
-   if(ok || ownedEndpoint(s))queueBootstrap(s);
+   // Native handlers can return false before creating parameters. An uncached
+   // display must still learn from hardware; the worker preserves native owners.
+   queueBootstrap(s);
   }
  }
  return ok;
@@ -284,6 +275,7 @@ void loaded(void *,KernelPatcher &patcher,size_t id,mach_vm_address_t address,si
   routeState("framebuffer-gate-unavailable");
   IOLog("DisplayBrightness: framebuffer gate resolution failed; no routes\n");patcher.clearError();return;
  }
+ resolvePreferenceBackend(patcher,id,address,size);
  // Interception first; publication stays disabled unless the entire route set succeeds.
  KernelPatcher::RouteRequest requests[]={
   {"__ZN9IODisplay12doIntegerSetEP12OSDictionaryPK8OSSymbolj",integer,originalInteger},
@@ -295,6 +287,7 @@ void loaded(void *,KernelPatcher &patcher,size_t id,mach_vm_address_t address,si
  }
  __atomic_store_n(&routesReady,true,__ATOMIC_RELEASE);
  routeState("ready");
+ requestLoginCheck();
  IOLog("DisplayBrightness: routes ready uiProbe=%d hardware=%d\n",uiRequested,hardwareRequested);
 }
 void hardwareInitFailed(const char *reason){
@@ -302,6 +295,7 @@ void hardwareInitFailed(const char *reason){
  uiRequested=false;hardwareRequested=false;
  if(retireCall){thread_call_free(retireCall);retireCall=nullptr;}
  if(admissionCall){thread_call_free(admissionCall);admissionCall=nullptr;}
+ if(loginCall){thread_call_free(loginCall);loginCall=nullptr;}
  if(hardwareQueue){IOLockFree(hardwareQueue);hardwareQueue=nullptr;}
  if(probeSerial){IOLockFree(probeSerial);probeSerial=nullptr;}
  routeState(reason);
@@ -311,11 +305,12 @@ void begin(){
  // Automatic capability probing is the only normal mode; -dboff is handled by Lilu.
  uiRequested=true;edmRequested=true;hardwareRequested=true;
  auto *root=IOService::getServiceRoot();if(root)root->setProperty("DisplayBrightnessStartupMode","automatic-brightness");
- if(root)root->setProperty("DisplayBrightnessStartupNotBeforeNanoseconds",dbstate::StartupDelay::notBeforeNs,64);
+ if(root)root->setProperty("DisplayBrightnessStartupGate","waiting-console-observer");
  hardwareQueue=IOLockAlloc();if(!hardwareQueue){hardwareInitFailed("hardware-queue-unavailable");return;}
- retireCall=thread_call_allocate_with_priority(retireWorker,nullptr,THREAD_CALL_PRIORITY_LOW);
- admissionCall=thread_call_allocate_with_priority(admissionWorker,nullptr,THREAD_CALL_PRIORITY_LOW);
- if(!retireCall||!admissionCall){hardwareInitFailed("bootstrap-workers-unavailable");return;}
+ retireCall=thread_call_allocate_with_options(retireWorker,nullptr,THREAD_CALL_PRIORITY_LOW,THREAD_CALL_OPTIONS_ONCE);
+ admissionCall=thread_call_allocate_with_options(admissionWorker,nullptr,THREAD_CALL_PRIORITY_LOW,THREAD_CALL_OPTIONS_ONCE);
+ loginCall=thread_call_allocate_with_options(loginWorker,nullptr,THREAD_CALL_PRIORITY_LOW,THREAD_CALL_OPTIONS_ONCE);
+ if(!retireCall||!admissionCall||!loginCall){hardwareInitFailed("bootstrap-workers-unavailable");return;}
  probeSerial=IOLockAlloc();if(!probeSerial){hardwareInitFailed("hardware-serial-unavailable");return;}
  routeState("registering-callback");
  auto e=lilu.onKextLoad(&graphics,1,loaded);
