@@ -4,7 +4,7 @@
 
 An experimental Lilu plugin that exposes external-monitor brightness through macOS display parameters and DDC/CI VCP 0x10.
 
-**Current version: 0.0.33, a test build that starts DDC after the first completed local login instead of a fixed 30-second delay.** Local tests and build checks pass; this version has not been boot-tested. Login-event timing and startup performance need hardware validation. Verified-history restoration was observed in the specified [0.0.32 runtime sample](docs/DEVELOPMENT.md#observed-runtime-sample); that does not validate the new scheduler.
+**Current version: 1.0.0, a test build that starts DDC after the first completed local login instead of a fixed 30-second delay.** Local tests and build checks pass; this version has not been boot-tested. Login-event timing and startup performance need hardware validation. Verified-history restoration was observed in the specified [0.0.32 runtime sample](docs/DEVELOPMENT.md#observed-runtime-sample); that does not validate the new scheduler.
 
 ## Requirements
 
@@ -40,7 +40,7 @@ python3 driver/test.py
 python3 driver/build.py --lilu /path/to/Lilu.kext --sdk /path/to/MacKernelSDK
 ```
 
-Output in `build/0.0.33/`: kext, matching dSYM, `DisplayBrightness-0.0.33-DEBUG.zip` and a build manifest. The ZIP includes both language READMEs and the design/troubleshooting guides. Building does not install or load the driver. See [artifact verification](docs/DEVELOPMENT.md#build-artifacts) for signature, UUID and checksum checks.
+Output in `build/1.0.0/`: kext, matching dSYM, `DisplayBrightness-1.0.0-DEBUG.zip` and a build manifest. The ZIP includes both language READMEs and the design/troubleshooting guides. Building does not install or load the driver. See [artifact verification](docs/DEVELOPMENT.md#build-artifacts) for signature, UUID and checksum checks.
 
 ## Install or roll back
 
@@ -51,12 +51,13 @@ Output in `build/0.0.33/`: kext, matching dSYM, `DisplayBrightness-0.0.33-DEBUG.
 
 To roll back, restore the previous kext or disable its entry. Adding `-dboff` to existing boot arguments also disables it after reboot; preserve unrelated arguments.
 
-### Upgrading to 0.0.33
+### Upgrading to 1.0.0
 
 | Previous version | Expected behavior |
 | --- | --- |
 | 0.0.31 or earlier | No verified-history record from this feature. Complete a local login to learn the hardware value; native sliders may need the next boot. |
 | 0.0.32 | Reuses valid verified-history records. The first login and display registration replace the fixed 30-second DDC gate. |
+| 0.0.33 | Version renumbering; retains the same login gating and native preference format. |
 
 Replace the existing bundle once and confirm the loaded version after reboot. No cache reset, new boot argument or login helper is needed. Before login, a cached interface can exist, but hardware reads and writes remain gated.
 

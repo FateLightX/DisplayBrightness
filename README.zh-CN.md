@@ -4,7 +4,7 @@
 
 通过 macOS 显示参数和 DDC/CI VCP 0x10 为外接显示器提供亮度接口的实验性 Lilu 插件。
 
-**当前版本为 0.0.33 测试版，改为首次本地登录完成后启动 DDC，取消固定 30 秒等待。** 本地测试与构建检查通过，尚未实机启动；登录事件时序及启动性能仍待验证。文中指定的 [0.0.32 运行样本](docs/DEVELOPMENT.md#observed-runtime-sample)已观察到缓存提前恢复，但不代表新调度方式已经通过验证。
+**当前版本为 1.0.0 测试版，改为首次本地登录完成后启动 DDC，取消固定 30 秒等待。** 本地测试与构建检查通过，尚未实机启动；登录事件时序及启动性能仍待验证。文中指定的 [0.0.32 运行样本](docs/DEVELOPMENT.md#observed-runtime-sample)已观察到缓存提前恢复，但不代表新调度方式已经通过验证。
 
 ## 运行要求
 
@@ -42,7 +42,7 @@ python3 driver/test.py
 python3 driver/build.py --lilu /path/to/Lilu.kext --sdk /path/to/MacKernelSDK
 ```
 
-产物位于 `build/0.0.33/`，包括 kext、配套 dSYM、`DisplayBrightness-0.0.33-DEBUG.zip` 和构建清单。ZIP 同时包含中英文 README、设计与排查文档。构建脚本不会安装或加载驱动，签名、UUID 和校验和的核对方法见[产物校验](docs/DEVELOPMENT.md#build-artifacts)。
+产物位于 `build/1.0.0/`，包括 kext、配套 dSYM、`DisplayBrightness-1.0.0-DEBUG.zip` 和构建清单。ZIP 同时包含中英文 README、设计与排查文档。构建脚本不会安装或加载驱动，签名、UUID 和校验和的核对方法见[产物校验](docs/DEVELOPMENT.md#build-artifacts)。
 
 ## 安装与回退
 
@@ -53,12 +53,13 @@ python3 driver/build.py --lilu /path/to/Lilu.kext --sdk /path/to/MacKernelSDK
 
 回退时恢复旧 kext 或禁用对应条目；在现有启动参数中追加 `-dboff` 也可在重启后禁用。保留其他启动参数。
 
-### 升级到 0.0.33
+### 升级到 1.0.0
 
 | 原版本 | 升级后的预期行为 |
 | --- | --- |
 | 0.0.31 及以前 | 尚无此功能保存的硬件历史记录；完成本地登录后学习实际亮度，原生滑块可能要到下次启动才出现。 |
 | 0.0.32 | 继续使用有效的硬件历史记录；DDC 从固定等待 30 秒改为首次登录完成且显示器已注册后启动。 |
+| 0.0.33 | 调整版本编号，沿用相同的登录门控和系统偏好记录格式。 |
 
 替换已有 kext 后重启并核对加载版本即可，无需清空缓存、添加新启动参数或安装登录助手。登录前可以已有缓存声明的接口，但硬件读写仍受登录门控限制。
 

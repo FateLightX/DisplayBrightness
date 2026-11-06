@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.0
+
+- Renumber the current build from 0.0.33 to 1.0.0, including bundle/module versions, package paths and documentation. Driver behavior and native preference format are unchanged.
+- This remains an experimental build; the version change does not establish cold-boot or startup-performance validation.
+
 ## 0.0.33
 
 - Replace the fixed boot delay with the first observed completed local console login and a registered target display. Register native notifications before reading the current registry snapshot, including preexisting login and late display publication.

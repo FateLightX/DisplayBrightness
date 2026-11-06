@@ -9,9 +9,9 @@ kmutil showloaded | rg 'org.displaybrightness.experimental|as.vit9696.Lilu'
 ioreg -lw0 -d 2 | rg DisplayBrightness
 ```
 
-The source version is 0.0.33. Root routing should be `ready`; `DisplayBrightnessCacheBackend` should be `symbols-resolved`. The latter means symbol resolution, not a loaded or durable cache. `DisplayBrightnessStartupGate` must reach `first-login-observed` before initial hardware probing. Compatibility rejection is expected on unsupported kernels or IOGraphics images; changing an Info.plist version does not fix an ABI mismatch.
+The source version is 1.0.0. Root routing should be `ready`; `DisplayBrightnessCacheBackend` should be `symbols-resolved`. The latter means symbol resolution, not a loaded or durable cache. `DisplayBrightnessStartupGate` must reach `first-login-observed` before initial hardware probing. Compatibility rejection is expected on unsupported kernels or IOGraphics images; changing an Info.plist version does not fix an ABI mismatch.
 
-Compiling or copying a new kext does not replace the one already loaded in the kernel. If the loaded version remains 0.0.32 or earlier after reboot, verify the actual boot EFI, its enabled OpenCore entry and the bundle at that entry's path. The old `DisplayBrightnessStartupNotBeforeNanoseconds` property belongs to the fixed-delay implementation and is absent in 0.0.33. Match the loaded UUID against the [built binary and dSYM](DEVELOPMENT.md#build-artifacts) when distinguishing rebuilds of the same version.
+Compiling or copying a new kext does not replace the one already loaded in the kernel. If the loaded version does not match 1.0.0 after reboot, verify the actual boot EFI, its enabled OpenCore entry and the bundle at that entry's path. The old `DisplayBrightnessStartupNotBeforeNanoseconds` property belongs to the fixed-delay implementation and is absent in 1.0.0. Match the loaded UUID against the [built binary and dSYM](DEVELOPMENT.md#build-artifacts) when distinguishing rebuilds of the same version.
 
 ## Each display
 
@@ -40,7 +40,7 @@ Before initialization, requests are discarded. A cached declaration remains unwr
 
 ## Verify login gating and startup performance
 
-Version 0.0.33 is a local test build; no boot or startup-performance result is claimed. Keep the previously working kext available for comparison and rollback.
+Version 1.0.0 is a local test build; no boot or startup-performance result is claimed. Keep the previously working kext available for comparison and rollback.
 
 | Root field | Meaning |
 | --- | --- |
@@ -60,7 +60,7 @@ Version 0.0.33 is a local test build; no boot or startup-performance result is c
 
 ## Verify learning and restoration
 
-Native cached restoration was observed in the specified 0.0.32 sample; 0.0.33 preserves the record format. Existing 0.0.31 installations have no record from this feature, so expect a learning boot after installing the test kext. No service restart is part of this procedure.
+Native cached restoration was observed in the specified 0.0.32 sample; 1.0.0 preserves the record format. Existing 0.0.31 installations have no record from this feature, so expect a learning boot after installing the test kext. No service restart is part of this procedure.
 
 1. On the learning boot, confirm the loaded version, complete a local login, then wait until background DDC initialization has run. A first reason of `cache-missing` is expected. Confirm `published-from-hardware`, `hardware-ready` and `accepted-native` for each display. Record its `CacheCurrent` and `CacheMaximum`. Native sliders may still be absent on this boot.
 2. Allow normal macOS preference processing before a normal shutdown/reboot; the native setter schedules a notification after about two seconds. That interval and an `accepted-native` result do **not** prove a disk flush.
