@@ -1,0 +1,6 @@
+.DS_Store
+/build/
+/diagnostics/
+/deps/
+__pycache__/
+*.py[cod]
