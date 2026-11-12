@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0
+
+- Import the hardware-side recovery improvements present in upstream DisplayBrightness 0.0.42 while retaining local login gating, verified native preferences and fair startup admission.
+- Re-probe an initialized endpoint when the active IOFramebuffer I2C interface or bound native brightness range changes after wake or connection churn. Inactive interfaces are ignored, and an ambiguous active set is rejected.
+- Track exact native brightness ownership through `Missing` / `Owned` / `Foreign` states and refuse hardware transport when another provider has taken over.
+- Give each brightness target its own bounded automatic retry budget. Repeating the same failed value cannot extend the exhausted cycle; a different target starts a fresh cycle.
+- Add a read-only `ExportBootLog.command` exporter with I2C topology, endpoint-refresh decisions, retry state, GPU hang/reset lines and recent kernel panic summaries.
+- Validation: 31 C++ tests, two source checks, kext compilation/linking, ad-hoc signature, ZIP integrity and matching dSYM. No live boot, sleep/wake or hot-plug result is claimed.
+
 ## 1.0.0
 
 - Renumber the current build from 0.0.33 to 1.0.0, including bundle/module versions, package paths and documentation. Driver behavior and native preference format are unchanged.

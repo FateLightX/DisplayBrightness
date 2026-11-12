@@ -81,7 +81,7 @@ void admissionWorker(thread_call_param_t,thread_call_param_t){
    FrameScope gate(ticket.display);
    if(gate.valid(ticket.display)&&gate.frameService==ticket.frame){
     publish(ticket.display,false,0);publishEDMMarker(ticket.display);
-    queueHardware(ticket.display,ticket.frame,0,true);
+    queueHardware(ticket.display,ticket.frame,0,true,ticket.recovery);
    }
   }
   releaseTickets(&ticket,1);
@@ -89,8 +89,8 @@ void admissionWorker(thread_call_param_t,thread_call_param_t){
  scheduleAdmission(); // One display per visit; yield with all native locks released.
 }
 // hardwareQueue held. Existing tickets already own their reference pair.
-bool rememberBootstrap(IOService *s,IOService *fb){
- auto result=pendingBootstrap.offer(s,fb);
+bool rememberBootstrap(IOService *s,IOService *fb,bool recovery=false){
+ auto result=pendingBootstrap.offer(s,fb,recovery);
  if(result==dbstate::Offer::Inserted){s->retain();fb->retain();}
  return result!=dbstate::Offer::Full;
 }

@@ -28,7 +28,7 @@ Pending tickets retain their display/framebuffer pair. Inactive entries and a di
 
 Nothing waits for a user login on a boot, registration or notification thread. Waiting does not consume retry rounds or arm periodic login timers. DDC work is still synchronous while holding a framebuffer gate, however: lower CPU priority and deferred execution do not prove zero impact on desktop rendering. Optional timing in the DDC `FrameScope` records gate wait and held duration; these properties are published after the gate is released. The measurements do not impose a timeout on an AMD call. A live cold-boot comparison remains required.
 
-Native console notification behavior was checked against [XNU IOService.cpp](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOService.cpp) (`updateConsoleUsers`, `registerInterest`, `applyToInterestNotifiers`). New imported symbols were also found as external definitions in the local boot kernel collection; this is not a load test of 1.0.0.
+Native console notification behavior was checked against [XNU IOService.cpp](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOService.cpp) (`updateConsoleUsers`, `registerInterest`, `applyToInterestNotifiers`). New imported symbols were also found as external definitions in the local boot kernel collection; this is not a load test of 1.1.0.
 
 ## Verified history in native preferences
 
@@ -38,7 +38,7 @@ The preference name is `DisplayBrightnessVerifiedState`. Native IOGraphics choos
 
 `VerifiedBrightness.hpp` defines a single 144-byte `OSData` record: magic, schema version 1, reserved zero bytes, the complete 128-byte EDID base block, 16-bit current and maximum, and CRC32. Multi-byte fields are little-endian. A record must have the exact length/version, valid checksum, matching valid EDID and a nonzero maximum with current at or below it. CRC detects accidental corruption; the record never authorizes a hardware write.
 
-Early reads only proceed when `IOGraphicsWorkLoop::inGate()` says the current thread already owns the system gate. They do not acquire another gate, wait or access DDC. A caller without that gate gets `cache-system-gate-not-held` and continues through login-gated learning. The specified 0.0.32 sample below observed this pre-registration path; 1.0.0 remains untested in a live boot.
+Early reads only proceed when `IOGraphicsWorkLoop::inGate()` says the current thread already owns the system gate. They do not acquire another gate, wait or access DDC. A caller without that gate gets `cache-system-gate-not-held` and continues through login-gated learning. The specified 0.0.32 sample below observed this pre-registration path; 1.1.0 remains untested in a live boot.
 
 After a successful initial read or verified write cycle, `VerifiedPersistence.inc` runs a synchronous action under the system workloop gate. The bus and all framebuffer/queue locks have already been released. The action takes the framebuffer gate, rechecks live topology, EDID and synthetic ownership, then checks readiness, retirement and request sequence under the queue lock. It releases the queue lock before calling the native setter, while the framebuffer gate excludes new submissions for that display. The lock order is system → framebuffer → queue; no system-gate acquisition occurs while a controller or bus lock is held. Retirement waits for the worker before clearing or reusing its slot.
 
@@ -47,6 +47,14 @@ After a successful initial read or verified write cycle, `VerifiedPersistence.in
 The cache seeds the interface only. It does not mark an endpoint writable, change a bootstrap ticket, enqueue a brightness request or restore monitor hardware. A monitor-menu change or another OS may make the historical value stale; the next hardware read corrects it. Without a valid record, the first learning boot may still miss native capability discovery. The next boot can use the learned record only if macOS retained it and loaded preferences before discovery. See the [two-boot procedure](TROUBLESHOOTING.md#verify-learning-and-restoration).
 
 Native implementation references: Apple's [IOFramebuffer.cpp](https://github.com/apple-oss-distributions/IOGraphics/blob/main/IOGraphicsFamily/IOFramebuffer.cpp) (`copyPreference`, `setPreference`, `writePrefs`, `IOFramebufferLockedSerialize`, `IOGraphicsWorkLoop::closeGate`) and [IODisplay.cpp](https://github.com/apple-oss-distributions/IOGraphics/blob/main/IOGraphicsFamily/IODisplay.cpp) (`loadPrefs`, `start`). Required symbols were also found in the UUID-matched local kernel collection; this does not substitute for running the new integration.
+
+## Endpoint recovery and retry budgets
+
+`EndpointRefresh.hpp` ignores inactive I2C services and accepts a path only when exactly one active service is visible. `HardwareWorker.inc` re-enumerates that set under the framebuffer gate before I/O and while classifying an initialized endpoint. A replaced or stopped interface, a changed framebuffer binding or a changed bound brightness object retires the old slot and queues a recovery ticket; the replacement performs a fresh hardware read before requests become writable again. Uninitialized slots keep their existing bounded startup window rather than being retired by an interface that is not bound yet.
+
+`ProviderPolicy.hpp` distinguishes a missing brightness object, the exact object owned by this endpoint, and a foreign native provider. Initialized writes require exact ownership plus the bound range; a foreign provider is never transported through. `LatestRequest.hpp` stores the active target and a per-target automatic retry counter. A different target starts a new budget when taken, while repeating the same failed target cannot extend an exhausted cycle.
+
+`ExportBootLog.command` is a read-only companion for field reports. It records I2C topology and active counts, endpoint-refresh decisions, retry state, GPU hang/reset lines and summaries from recent kernel panic files. It does not change services, NVRAM or display state.
 
 ## Compatibility scope
 
@@ -60,7 +68,7 @@ CoreBrightness may cache capabilities during device construction. Ordinary value
 
 Run `python3 driver/test.py` from the repository root.
 
-The suite contains 29 C++ programs and two source checks. It covers packets, read recovery, coalescing, endpoint retirement/reuse, identity/topology, login admission, scheduling, state synchronization, publication ownership and verified history.
+The suite contains 31 C++ programs and two source checks. It covers packets, read recovery, coalescing, endpoint retirement/reuse, active-interface selection, endpoint refresh, provider ownership, per-target retry budgets, identity/topology, login admission, scheduling, state synchronization, publication ownership and verified history.
 
 The publication and preference harnesses execute the implementations included by the kext, using reference-counted registry and native-preference doubles. They test missing dictionaries/cache records, real zero, unchanged saves, allocation failures, false native acceptance, native owner preservation and no early cache replay. The actual commit callback is exercised with gate assertions and stale, pending, retired, stopped and replaced endpoints. Codec tests reject bit corruption, unknown schemas, bad ranges and changed EDID identity. Source checks verify the kernel wiring and lock acquisition order; they do not exercise real kernel scheduling.
 
@@ -68,7 +76,7 @@ The console and admission harnesses also execute production functions. They cove
 
 Public fixtures use synthetic or serial-redacted EDIDs. Actual cache records contain the device's base EDID locally; reports need only the diagnostic fields, not raw preference records or full registry dumps.
 
-These checks do not exercise a running kernel, DDC transport, native persistence, UI, cold boot, sleep/wake or hot-plug. No live boot of 1.0.0 has been observed. See [runtime checks](TROUBLESHOOTING.md).
+These checks do not exercise a running kernel, DDC transport, native persistence, UI, cold boot, sleep/wake or hot-plug. No live boot of 1.1.0 has been observed. See [runtime checks](TROUBLESHOOTING.md).
 
 ### Build artifacts
 
@@ -77,12 +85,12 @@ The build script compiles and links x86_64 kernel code, generates dSYM, applies 
 From the repository root, check the resulting package:
 
 ```sh
-codesign --verify --strict build/1.0.0/DisplayBrightness.kext
-xcrun dwarfdump --uuid build/1.0.0/DisplayBrightness.kext/Contents/MacOS/DisplayBrightness build/1.0.0/DisplayBrightness.kext.dSYM
-shasum -a 256 build/1.0.0/DisplayBrightness-1.0.0-DEBUG.zip
+codesign --verify --strict build/1.1.0/DisplayBrightness.kext
+xcrun dwarfdump --uuid build/1.1.0/DisplayBrightness.kext/Contents/MacOS/DisplayBrightness build/1.1.0/DisplayBrightness.kext.dSYM
+shasum -a 256 build/1.1.0/DisplayBrightness-1.1.0-DEBUG.zip
 ```
 
-The binary and dSYM must have the same x86_64 UUID. The ZIP SHA256 must match `archive_sha256` in `build/1.0.0/build-manifest.json`. This local manifest also records source hashes and toolchain paths; it is not included in the ZIP. The ZIP contains the kext, matching symbols, both READMEs, changelog, license and design/troubleshooting guides. Build output is ignored by Git.
+The binary and dSYM must have the same x86_64 UUID. The ZIP SHA256 must match `archive_sha256` in `build/1.1.0/build-manifest.json`. This local manifest also records source hashes and toolchain paths; it is not included in the ZIP. The ZIP contains the kext, matching symbols, both READMEs, changelog, license, design/troubleshooting guides and the read-only boot-log exporter. Build output is ignored by Git.
 
 Old version directories and the optional compiled `build/display-api-status` tool can be removed after preserving any needed rollback packages outside the repository. Keep symbols with their matching binary when archiving a build. Git tracks the diagnostic source, not its executable or local logs.
 

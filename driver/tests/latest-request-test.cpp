@@ -15,5 +15,19 @@ int main(){
  assert(q.submit(70,start));assert(q.take()==70);
  for(unsigned i=0;i<10;i++){assert(q.complete(false));assert(q.take()==70);}
  assert(!q.complete(true));
- puts("unlimited normal requests; automatic failure recovery; latest target preserved; bounds pass");
+
+ // A hardware-bound failure has a per-target budget. Repeating the same value
+ // cannot extend it, while a genuinely new target starts a fresh cycle.
+ dbhw::LatestRequest bounded;bounded.submit(40,start);assert(start&&bounded.take()==40);
+ assert(bounded.complete(false,true,2));assert(bounded.take()==40);
+ assert(bounded.complete(false,true,2));assert(bounded.take()==40);
+ assert(!bounded.complete(false,true,2));assert(bounded.failed&&!bounded.busy);
+ assert(bounded.submit(40,start)&&start);assert(bounded.take()==40);
+ assert(bounded.complete(false,true,2));assert(bounded.take()==40);
+ assert(bounded.complete(false,true,2));assert(bounded.take()==40);
+ assert(!bounded.complete(false,true,2));assert(!bounded.busy); // A new user cycle resets the budget.
+ assert(bounded.submit(10,start)&&start);assert(bounded.take()==10);
+ assert(bounded.complete(false,true,2));assert(bounded.busy);
+ assert(bounded.take()==10);assert(bounded.complete(false,true,2));
+ puts("unlimited normal requests; automatic startup recovery; same-target retry budget; new-target recovery; latest target pass");
 }

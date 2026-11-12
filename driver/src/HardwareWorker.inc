@@ -3,11 +3,13 @@
 struct HardwareSlot {
  IOService *display=nullptr,*frame=nullptr,*interface=nullptr;
  IORegistryEntry *connection=nullptr;
+ OSObject *boundRange=nullptr;
  thread_call_t call=nullptr;
  UInt8 boundEDID[128]={};
  dbstate::BootstrapWindow bootstrapWindow;
  dbstate::BootstrapAttempt bootAttempt;dbstate::BootstrapJournal bootJournal;
  bool superseded=false;
+ bool recoveryProbe=false,recoveryReadmit=false;
  bool haveOriginal=false,retiring=false,reclaiming=false,terminal=false;
  dbhw::EndpointRequests requests;
  UInt64 sequence=0;UInt16 verifiedCurrent=0,verifiedMaximum=0;
@@ -17,7 +19,7 @@ HardwareSlot hardwareSlots[dbcompat::endpointCapacity];
 IOLock *hardwareQueue=nullptr;
 bool hardwareRequested=false;
 thread_call_t retireCall=nullptr,admissionCall=nullptr;
-bool queueHardware(IOService *,IOService *,UInt32,bool);
+bool queueHardware(IOService *,IOService *,UInt32,bool=false,bool=false);
 #include "BootstrapAdmission.inc"
 
 void retireWorker(thread_call_param_t,thread_call_param_t){
@@ -34,29 +36,39 @@ void retireWorker(thread_call_param_t,thread_call_param_t){
   IOLockLock(hardwareQueue);
   IOService *display=c.display,*frame=c.frame,*interface=c.interface;
   IORegistryEntry *connection=c.connection;c.connection=nullptr;
+  OSObject *range=c.boundRange;c.boundRange=nullptr;
   c.display=nullptr;c.frame=nullptr;c.interface=nullptr;
   c.bootstrapWindow=dbstate::BootstrapWindow{};
   c.bootAttempt=dbstate::BootstrapAttempt{};c.bootJournal=dbstate::BootstrapJournal{};
   c.requests=dbhw::EndpointRequests{};c.haveOriginal=false;c.terminal=false;
   c.sequence=0;c.verifiedCurrent=0;c.verifiedMaximum=0;
   c.haveNotified=false;c.lastNotifiedPercent=0;c.superseded=false;
+  c.recoveryProbe=false;c.recoveryReadmit=false;
   bootstrapTurns.cancel(slotIndex(&c));
   // Keep the completed thread_call object stable for reuse; never free in flight.
   c.retiring=false;c.reclaiming=false;
   admissionWaitingForRetirement=false;
   IOLockUnlock(hardwareQueue);
-  if(interface)interface->release();if(connection)connection->release();if(frame)frame->release();if(display)display->release();
+  if(range)range->release();if(interface)interface->release();if(connection)connection->release();if(frame)frame->release();if(display)display->release();
   scheduleAdmission();
  }
 }
 
-bool ownedEndpoint(IOService *s){
- OSObject *o=s->copyProperty(ownerKey),*p=s->copyProperty("IODisplayParameters");
- auto *params=OSDynamicCast(OSDictionary,p);
- auto *range=OSDynamicCast(OSDictionary,o);
- bool ok=range && params && params->getObject("brightness")==range && range->getObject("DisplayBrightnessSynthetic")==kOSBooleanTrue;
- if(o)o->release();if(p)p->release();return ok;
+// Caller holds the native framebuffer gate. Ownership requires the exact
+// brightness object in this snapshot, not merely an old marker on the service.
+dbhw::BrightnessProvider brightnessProvider(IOService *s,OSObject **ownedRange=nullptr){
+ if(ownedRange)*ownedRange=nullptr;
+ OSObject *owner=s->copyProperty(ownerKey);
+ OSObject *property=s->copyProperty("IODisplayParameters");
+ auto *params=OSDynamicCast(OSDictionary,property);
+ auto *range=OSDynamicCast(OSDictionary,owner);
+ auto *current=params?params->getObject("brightness"):nullptr;
+ auto provider=dbhw::brightnessProvider(current!=nullptr,current==owner,
+  range && range->getObject("DisplayBrightnessSynthetic")==kOSBooleanTrue);
+ if(ownedRange && provider==dbhw::BrightnessProvider::Owned){*ownedRange=owner;owner=nullptr;}
+ if(property)property->release();if(owner)owner->release();return provider;
 }
+bool ownedEndpoint(IOService *s){return brightnessProvider(s)==dbhw::BrightnessProvider::Owned;}
 bool endpointReady(IOService *s){
  if(!hardwareQueue||!loginGate.allowed())return false;
  bool ready=false;
@@ -78,17 +90,49 @@ bool captureEndpointEDID(IOService *s,UInt8 (&bound)[128]){
  if(ok)memcpy(bound,e->getBytesNoCopy(),128);
  if(o)o->release();return ok;
 }
+IOService *copyUniqueActiveInterface(IOService *frame,unsigned &count,bool *enumerated=nullptr){
+ dbhw::ActiveInterfaces<IOService> interfaces;
+ OSIterator *it=frame?frame->getChildIterator(gIOServicePlane):nullptr;
+ if(enumerated)*enumerated=it!=nullptr;
+ if(it){
+  while(auto *child=it->getNextObject()){
+   auto *service=OSDynamicCast(IOService,child);
+   if(service && hasClass(service,"IOFramebufferI2CInterface"))
+    interfaces.observe(service,service->isInactive());
+  }
+  it->release();
+ }
+ count=interfaces.count;
+ IOService *selected=interfaces.unique();
+ if(selected)selected->retain();
+ return selected;
+}
+OSNumber *copyTransactionTypes(IOService *service){
+ if(!service)return nullptr;
+ OSObject *object=service->copyProperty("IOI2CTransactionTypes");
+ auto *types=OSDynamicCast(OSNumber,object);
+ if(object && !types)object->release();
+ return types;
+}
+bool supportsSimple(OSNumber *types){
+ return types && (types->unsigned32BitValue()&(1U<<kIOI2CSimpleTransactionType));
+}
 bool hardwareLive(HardwareSlot *c,FrameScope &gate,bool bootstrapRead=false){
  if(!c->interface || !gate.valid(c->display))return false;
- // Re-enumerate under this framebuffer's native gate; no stale interface cache.
- unsigned count=0;bool selected=false;
- auto *it=c->frame->getChildIterator(gIOServicePlane);
- if(it){while(auto *o=it->getNextObject()){
-  auto *candidate=OSDynamicCast(IOService,o);
-  if(candidate && hasClass(candidate,"IOFramebufferI2CInterface")){
-   ++count;if(candidate==c->interface)selected=true;
-  }
- }it->release();}
+ IOLockLock(hardwareQueue);bool retiring=c->retiring||c->reclaiming;IOLockUnlock(hardwareQueue);
+ if(retiring)return false;
+ OSObject *range=nullptr;
+ auto provider=brightnessProvider(c->display,&range);
+ bool allowed=dbhw::allowsTransport(provider,c->requests.initialized,range && range==c->boundRange,bootstrapRead);
+ if(range)range->release();
+ if(!allowed)return false;
+ // Re-enumerate under this framebuffer's native gate. Only active interfaces
+ // participate, so a stale replacement cannot make the path look ambiguous.
+ unsigned count=0;bool enumerated=false;
+ IOService *active=copyUniqueActiveInterface(c->frame,count,&enumerated);
+ bool selected=active==c->interface;
+ if(active)active->release();
+ c->display->setProperty("DisplayBrightnessI2CActiveCount",count,32);
  if(!dbcompat::sameTopology(c->connection,gate.connection,c->frame,gate.frameService,count,selected))return false;
  auto *parent=c->interface->copyParentEntry(gIOServicePlane);
  bool ok=hardwarePilot(c->display) && endpointEDIDMatches(c) && gate.valid(c->display) && gate.frameService==c->frame && parent==c->frame && !c->interface->isInactive() && (ownedEndpoint(c->display) || (bootstrapRead && !c->requests.initialized));
@@ -171,26 +215,20 @@ bool hardwareRead(HardwareSlot *c,dbddc::Brightness &b,const char *operation,boo
 bool prepareBootstrapInterface(HardwareSlot *c){
  FrameScope gate(c->display);
  if(!gate.valid(c->display)||!endpointEDIDMatches(c)||gate.connection!=c->connection||gate.frameService!=c->frame){c->terminal=true;return false;}
- OSObject *paramsObject=c->display->copyProperty("IODisplayParameters");
- auto *params=OSDynamicCast(OSDictionary,paramsObject);
- bool nativeBrightness=params && params->getObject("brightness") && !ownedEndpoint(c->display);
- if(paramsObject)paramsObject->release();
- if(nativeBrightness){c->terminal=true;c->display->setProperty("DisplayBrightnessBootstrapState","native-provider-preserved");return false;}
+ if(brightnessProvider(c->display)==dbhw::BrightnessProvider::Foreign){
+  c->terminal=true;c->display->setProperty("DisplayBrightnessBootstrapState","native-provider-preserved");return false;
+ }
  if(c->interface)return true;
- IOService *iface=nullptr;unsigned count=0;
- auto *it=c->frame->getChildIterator(gIOServicePlane);
- if(it){while(auto *o=it->getNextObject()){
-  auto *candidate=OSDynamicCast(IOService,o);
-  if(candidate && hasClass(candidate,"IOFramebufferI2CInterface")){++count;if(!iface){iface=candidate;iface->retain();}}
- }it->release();}
- auto *o=iface?iface->copyProperty("IOI2CTransactionTypes"):nullptr;
- auto *types=OSDynamicCast(OSNumber,o);
- bool supported=count==1 && types && (types->unsigned32BitValue()&(1U<<kIOI2CSimpleTransactionType));
- if(o)o->release();
+ unsigned count=0;
+ IOService *iface=copyUniqueActiveInterface(c->frame,count);
+ OSNumber *types=copyTransactionTypes(iface);
+ bool supported=dbhw::interfaceUsable(count,iface!=nullptr,iface&&iface->isInactive(),supportsSimple(types));
+ if(types)types->release();
+ c->display->setProperty("DisplayBrightnessI2CActiveCount",count,32);
  if(supported){IOLockLock(hardwareQueue);c->interface=iface;IOLockUnlock(hardwareQueue);return true;}
  if(iface)iface->release();
  if(count>1)c->terminal=true;
- c->display->setProperty("DisplayBrightnessBootstrapState",count>1?"ambiguous-interface":"waiting-interface");
+ c->display->setProperty("DisplayBrightnessBootstrapState",count>1?"ambiguous-interface":(count==0?"waiting-interface-change":"waiting-interface"));
  return false;
 }
 bool initializeEndpoint(HardwareSlot *c){
@@ -208,17 +246,24 @@ bool initializeEndpoint(HardwareSlot *c){
   FrameScope gate(c->display);
   if(!hardwareLive(c,gate,true)){c->terminal=true;return false;}
   bool published=publish(c->display,true,value);publishEDMMarker(c->display);
-  if(!published || !ownedEndpoint(c->display)){
+  OSObject *range=nullptr;
+  auto provider=brightnessProvider(c->display,&range);
+  if(!published || !range){
    OSObject *p=c->display->copyProperty("IODisplayParameters");auto *d=OSDynamicCast(OSDictionary,p);
-   if(d && d->getObject("brightness"))c->terminal=true;
-   if(p)p->release();return false;
+   if(d && d->getObject("brightness"))c->terminal=provider==dbhw::BrightnessProvider::Foreign;
+   if(p)p->release();if(range)range->release();return false;
   }
   c->verifiedCurrent=raw.current;c->verifiedMaximum=raw.maximum;
   c->display->setProperty("DisplayBrightnessHardwareOriginal",raw.current,32);
   c->display->setProperty("DisplayBrightnessHardwareOriginalMaximum",raw.maximum,32);c->haveOriginal=true;
   c->display->setProperty("DisplayBrightnessBootstrapState","published-from-hardware");
   c->display->setProperty("DisplayBrightnessInterfaceState","hardware-ready");
-  IOLockLock(hardwareQueue);c->requests.initialized=true;IOLockUnlock(hardwareQueue);
+  IOLockLock(hardwareQueue);
+  bool commit=range && !c->retiring && !c->reclaiming;
+  if(commit){c->boundRange=range;range=nullptr;c->requests.initialized=true;}
+  IOLockUnlock(hardwareQueue);
+  if(range)range->release();
+  if(!commit){c->terminal=true;return false;}
   c->bootAttempt.phase=dbstate::BootstrapPhase::Ready;
   return true;
  });
@@ -364,7 +409,11 @@ void hardwareWorker(thread_call_param_t arg,thread_call_param_t){
  if(!live)c->requests.stop();
  bool yielded=c->superseded&&live;
  if(yielded)c->display->setProperty("DisplayBrightnessHardwareState","superseded-unverified");
- if(live && c->requests.complete(ok||yielded)){
+ bool reschedule=live&&c->requests.complete(ok||yielded,initialized,dbhw::LatestRequest::maxAutomaticFailureRetries);
+ c->display->setProperty("DisplayBrightnessRequestRetries",c->requests.automaticFailureRetries,32);
+ if(live && initialized && !ok && !yielded && !reschedule)
+  c->display->setProperty("DisplayBrightnessHardwareState","request-retries-exhausted");
+ if(reschedule){
   if(!ok&&!yielded)c->display->setProperty("DisplayBrightnessHardwareState",initialized?"recovering-read-before-write":"probe-cooldown");
   if(c->requests.initialized){
    uint64_t deadline;clock_interval_to_deadline((ok||yielded)?50:2000,kMillisecondScale,&deadline);
@@ -386,7 +435,7 @@ void endpointSnapshot(IOService *s,const char *reason,unsigned interfaces){
  put(d,"event",nextEvent());put(d,"interfaceCount",interfaces);
  put(d,"requestDisplay",s->getRegistryEntryID());
  for(unsigned i=0;i<dbcompat::endpointCapacity;i++){
-  auto &c=hardwareSlots[i];auto *item=OSDictionary::withCapacity(9);if(!item)continue;
+  auto &c=hardwareSlots[i];auto *item=OSDictionary::withCapacity(12);if(!item)continue;
   put(item,"display",c.display?c.display->getRegistryEntryID():0);
   put(item,"frame",c.frame?c.frame->getRegistryEntryID():0);
   put(item,"interface",c.interface?c.interface->getRegistryEntryID():0);
@@ -395,41 +444,90 @@ void endpointSnapshot(IOService *s,const char *reason,unsigned interfaces){
   item->setObject("busy",c.requests.busy?kOSBooleanTrue:kOSBooleanFalse);
   item->setObject("pending",c.requests.pending?kOSBooleanTrue:kOSBooleanFalse);
   item->setObject("failed",c.requests.failed?kOSBooleanTrue:kOSBooleanFalse);
+  item->setObject("recoveryProbe",c.recoveryProbe?kOSBooleanTrue:kOSBooleanFalse);
   put(item,"desired",c.requests.desired);
+  put(item,"activeTarget",c.requests.activeTarget);
+  put(item,"automaticFailureRetries",c.requests.automaticFailureRetries);
   char key[16];snprintf(key,sizeof(key),"slot%u",i);
   d->setObject(key,item);item->release();
  }
  s->setProperty("DisplayBrightnessEndpointSnapshot",d);d->release();
 }
-bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=false){
+// Called with the native framebuffer gate and queue held; never acquires a gate.
+dbhw::Refresh refreshEndpoint(HardwareSlot *c,IOService *s,IOService *fb){
+ auto *connection=s->copyParentEntry(gIOServicePlane);
+ bool sameBinding=c->frame==fb&&c->connection==connection&&endpointEDIDMatches(c);
+ if(connection)connection->release();
+ unsigned count=0;
+ IOService *selected=copyUniqueActiveInterface(fb,count);
+ OSNumber *types=copyTransactionTypes(selected);
+ bool supported=dbhw::interfaceUsable(count,selected!=nullptr,selected&&selected->isInactive(),supportsSimple(types));
+ bool sameInterface=c->interface?(supported&&selected==c->interface):!supported;
+ if(types)types->release();if(selected)selected->release();
+ OSObject *range=nullptr;
+ auto provider=brightnessProvider(s,&range);
+ bool sameRange=range&&range==c->boundRange;
+ bool bootstrapPending=pendingBootstrap.recoveryPending(s,fb);
+ auto result=dbhw::endpointRefresh(c->requests.initialized,c->requests.stopped,sameBinding,
+  sameInterface,sameRange,provider==dbhw::BrightnessProvider::Foreign,false,
+  bootstrapPending,supported);
+ if(range)range->release();
+ s->setProperty("DisplayBrightnessI2CActiveCount",count,32);
+ const char *decision=result==dbhw::Refresh::Reprobe?"reprobe":(result==dbhw::Refresh::Retire?"retire":"keep");
+ s->setProperty("DisplayBrightnessEndpointRefresh",decision);
+ return result;
+}
+bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap,bool recovery){
  // Called inside the native gate; no bus operations here.
  if(!hardwarePilot(s))return false;
  if(!hardwareRequested || !startIO || !probeSerial || !hardwareQueue || desired>100||!loginGate.allowed())return false;
+ bool foreign=bootstrap&&brightnessProvider(s)==dbhw::BrightnessProvider::Foreign;
  IOLockLock(hardwareQueue);
  HardwareSlot *slot=nullptr,*empty=nullptr;
- const char *reason="slots-full";unsigned interfaceCount=0;bool retireNeeded=false,retirementPending=false;
+ const char *reason="slots-full";unsigned interfaceCount=0;
+ bool retireNeeded=false,retirementPending=false,matchingRetiring=false;
+ bool recoveryTicketFull=false;
  for(auto &candidate:hardwareSlots){
-  if(retireCall && dbhw::canRetire(candidate.display!=nullptr,candidate.display && candidate.display->isInactive(),candidate.requests.busy,candidate.retiring)){
+  unsigned index=static_cast<unsigned>(&candidate-hardwareSlots);
+  if(retireCall && dbhw::canRetire(candidate.display!=nullptr,candidate.display && candidate.display->isInactive(),
+     candidate.requests.busy,candidate.retiring,false)){
    candidate.retiring=true;retireNeeded=true;
   }
-  if(!candidate.retiring && candidate.display==s)slot=&candidate;
-  if(!candidate.retiring && !candidate.display && !empty)empty=&candidate;
+  if(candidate.display==s){
+   if(!candidate.retiring && bootstrap && retireCall){
+    auto refresh=dbhw::Refresh::Keep;
+    if(foreign)refresh=dbhw::Refresh::Retire;
+    else if(candidate.requests.initialized)refresh=refreshEndpoint(&candidate,s,fb);
+    if(refresh==dbhw::Refresh::Reprobe){
+     if(!rememberBootstrap(s,fb,true))recoveryTicketFull=true;
+     else{candidate.retiring=true;candidate.recoveryReadmit=true;retireNeeded=true;recovery=true;}
+    }else if(refresh==dbhw::Refresh::Retire){
+     candidate.retiring=true;candidate.recoveryReadmit=false;retireNeeded=true;foreign=true;
+    }
+   }
+   if(candidate.retiring){matchingRetiring=true;if(candidate.recoveryReadmit)recovery=true;}
+   else slot=&candidate;
+  }
+  if(index<dbcompat::endpointCapacity && !candidate.retiring && !candidate.display && !empty)empty=&candidate;
   retirementPending|=candidate.retiring;
  }
- if(!slot && empty && bootstrap){
-  IOService *iface=nullptr;unsigned count=0;
+ if(foreign||recoveryTicketFull){
+  auto ticket=foreign?pendingBootstrap.takePair(s,fb):PendingBootstrap::Ticket{};
+  IOLockUnlock(hardwareQueue);
+  releaseTickets(&ticket,ticket.display?1:0);
+  if(retireNeeded)thread_call_enter(retireCall);
+  s->setProperty("DisplayBrightnessBootstrapState",foreign?"native-provider-preserved":"recovery-pending-full");
+  return false;
+ }
+ if(!slot && empty && bootstrap && !matchingRetiring){
+  unsigned count=0;
   reason="interface-iterator-unavailable";
-  OSIterator *it=fb->getChildIterator(gIOServicePlane);
-  if(it){while(auto *o=it->getNextObject()){
-   auto *p=OSDynamicCast(IOService,o);
-   if(p && hasClass(p,"IOFramebufferI2CInterface")){++count;if(!iface){iface=p;iface->retain();}}
-  }it->release();}
+  IOService *iface=copyUniqueActiveInterface(fb,count);
   interfaceCount=count;
-  if(it)reason=count==0?"interface-not-ready":(count!=1?"ambiguous-interface":"missing-transaction-types");
-  OSObject *types=iface?iface->copyProperty("IOI2CTransactionTypes"):nullptr;
-  auto *n=OSDynamicCast(OSNumber,types);
-  bool supported=count==1 && n && (n->unsigned32BitValue()&(1U<<kIOI2CSimpleTransactionType));
-  if(n && count==1)reason=supported?"thread-call-allocation-failed":"unsupported-transaction";
+  reason=count==0?"interface-not-ready":(count!=1?"ambiguous-interface":"missing-transaction-types");
+  OSNumber *types=copyTransactionTypes(iface);
+  bool supported=dbhw::interfaceUsable(count,iface!=nullptr,iface&&iface->isInactive(),supportsSimple(types));
+  if(types && count==1)reason=supported?"thread-call-allocation-failed":"unsupported-transaction";
   if(types)types->release();
   if(supported || bootstrap){
    if(!empty->call)empty->call=thread_call_allocate_with_options(hardwareWorker,empty,THREAD_CALL_PRIORITY_LOW,THREAD_CALL_OPTIONS_ONCE);
@@ -437,6 +535,7 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
     auto *connection=s->copyParentEntry(gIOServicePlane);
     auto *parent=connection?connection->copyParentEntry(gIOServicePlane):nullptr;
     if(hasClass(connection,"IODisplayConnect") && parent==fb){
+      empty->recoveryProbe=recovery;
      empty->connection=connection;connection=nullptr;
      empty->display=s;empty->frame=fb;empty->interface=supported?iface:nullptr;
      s->retain();fb->retain();slot=empty;if(supported)iface=nullptr;
@@ -466,7 +565,7 @@ bool queueHardware(IOService *s,IOService *fb,UInt32 desired,bool bootstrap=fals
  bool retryAdmission=false;
  // A full set of active slots must not create an endless admission poll.
  if(!slot && bootstrap && admissionCall && retirementPending){
-  retryAdmission=rememberBootstrap(s,fb);
+  retryAdmission=rememberBootstrap(s,fb,recovery);
   admissionWaitingForRetirement=retryAdmission;
   reason=retryAdmission?"bootstrap-admission-queued":"bootstrap-pending-full";
  }

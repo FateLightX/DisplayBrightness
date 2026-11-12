@@ -117,4 +117,16 @@ for source in root.iterdir():
         for removed in ('provisionalBrightness', 'EarlyDisplayProfiles', 'knownEarlyFingerprint', 'DisplayBrightnessProvisionalPercent', 'StartupDelay', 'startupRemainingMs', '30000000000ULL'):
             assert removed not in source.read_text(), f'{removed} must not return'
 assert worker.count('startIO(c->interface,&q)') == 1
+assert 'copyUniqueActiveInterface(c->frame,count' in worker
+assert 'DisplayBrightnessI2CActiveCount' in worker
+assert 'candidate.requests.initialized' in submission
+assert 'refreshEndpoint(&candidate,s,fb)' in submission
+assert 'rememberBootstrap(s,fb,true)' in submission
+assert 'candidate.recoveryReadmit=true' in submission
+assert 'complete(ok||yielded,initialized,dbhw::LatestRequest::maxAutomaticFailureRetries)' in hardware
+assert 'DisplayBrightnessRequestRetries' in hardware
+exporter = (root.parent / 'ExportBootLog.command').read_text()
+for evidence in ('I2CActiveCount', 'EndpointRefresh', 'RequestRetries',
+                 'GPU hang', 'GPU reset', 'Kernel-*.panic'):
+    assert evidence in exporter, f'exporter missing {evidence}'
 print('startup/cache wiring: login-only admission and I/O; signal-only observer; serialized workers; fair bootstrap turns; cache-only early UI; verified persistence and lock order')

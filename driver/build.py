@@ -64,6 +64,7 @@ with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as z:
         for path in sorted((output / name).rglob('*')):
             if path.is_file():
                 z.write(path, path.relative_to(output))
+    z.write(root / 'ExportBootLog.command', 'ExportBootLog.command')
     for name in ('README.md', 'README.zh-CN.md', 'CHANGELOG.md', 'LICENSE-Lilu.txt',
                  'docs/DEVELOPMENT.md', 'docs/TROUBLESHOOTING.md'):
         z.write(root.parent / name, name)

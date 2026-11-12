@@ -32,17 +32,18 @@ struct FrameScope {
 };
 bool publish(IOService *,bool,unsigned){assert(frameDepth&&loginGate.allowed());return false;}
 void publishEDMMarker(IOService *){assert(frameDepth);}
-struct HardwareSlot {IOService *display=nullptr;Call *call=nullptr;bool retiring=false;dbhw::EndpointRequests requests;};
+struct HardwareSlot {IOService *display=nullptr;Call *call=nullptr;bool retiring=false,recoveryProbe=false;dbhw::EndpointRequests requests;};
 HardwareSlot hardwareSlots[dbcompat::endpointCapacity];
-bool queueHardware(IOService *,IOService *,UInt32,bool);
+bool queueHardware(IOService *,IOService *,UInt32,bool,bool);
 #include "../src/BootstrapAdmission.inc"
-bool queueHardware(IOService *s,IOService *,UInt32 value,bool bootstrap){
+bool queueHardware(IOService *s,IOService *,UInt32 value,bool bootstrap,bool recovery){
  assert(frameDepth&&!locked&&loginGate.allowed()&&bootstrap&&value==0);
  IOLockLock(hardwareQueue);
  unsigned i=0;
  for(;i<dbcompat::endpointCapacity;i++)if(hardwareSlots[i].display==s)break;
  if(i==dbcompat::endpointCapacity)for(i=0;i<dbcompat::endpointCapacity;i++)if(!hardwareSlots[i].display)break;
  assert(i<dbcompat::endpointCapacity);auto &slot=hardwareSlots[i];slot.display=s;slot.call=&work[i];
+ slot.recoveryProbe=recovery;
  bool schedule=false;assert(slot.requests.submitBootstrap(schedule));
  if(schedule)bootstrapTurns.offer(i,now);
  IOLockUnlock(hardwareQueue);scheduleAdmission();return true;

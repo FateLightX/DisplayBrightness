@@ -9,14 +9,14 @@ kmutil showloaded | rg 'org.displaybrightness.experimental|as.vit9696.Lilu'
 ioreg -lw0 -d 2 | rg DisplayBrightness
 ```
 
-The source version is 1.0.0. Root routing should be `ready`; `DisplayBrightnessCacheBackend` should be `symbols-resolved`. The latter means symbol resolution, not a loaded or durable cache. `DisplayBrightnessStartupGate` must reach `first-login-observed` before initial hardware probing. Compatibility rejection is expected on unsupported kernels or IOGraphics images; changing an Info.plist version does not fix an ABI mismatch.
+The source version is 1.1.0. Root routing should be `ready`; `DisplayBrightnessCacheBackend` should be `symbols-resolved`. The latter means symbol resolution, not a loaded or durable cache. `DisplayBrightnessStartupGate` must reach `first-login-observed` before initial hardware probing. Compatibility rejection is expected on unsupported kernels or IOGraphics images; changing an Info.plist version does not fix an ABI mismatch.
 
-Compiling or copying a new kext does not replace the one already loaded in the kernel. If the loaded version does not match 1.0.0 after reboot, verify the actual boot EFI, its enabled OpenCore entry and the bundle at that entry's path. The old `DisplayBrightnessStartupNotBeforeNanoseconds` property belongs to the fixed-delay implementation and is absent in 1.0.0. Match the loaded UUID against the [built binary and dSYM](DEVELOPMENT.md#build-artifacts) when distinguishing rebuilds of the same version.
+Compiling or copying a new kext does not replace the one already loaded in the kernel. If the loaded version does not match 1.1.0 after reboot, verify the actual boot EFI, its enabled OpenCore entry and the bundle at that entry's path. The old `DisplayBrightnessStartupNotBeforeNanoseconds` property belongs to the fixed-delay implementation and is absent in 1.1.0. Match the loaded UUID against the [built binary and dSYM](DEVELOPMENT.md#build-artifacts) when distinguishing rebuilds of the same version.
 
 ## Each display
 
 ```sh
-ioreg -lw0 -r -c AppleDisplay | rg 'DisplayProductID|DisplayBrightness(FirstUpdate|EarlyDeclaration|Cache|InterfaceState|BootstrapState|StateSync|HardwareState|DDCFrame|InitialRead)'
+ioreg -lw0 -r -c AppleDisplay | rg 'DisplayProductID|DisplayBrightness(FirstUpdate|EarlyDeclaration|Cache|I2CActiveCount|EndpointRefresh|RequestRetries|InterfaceState|BootstrapState|StateSync|HardwareState|DDCFrame|InitialRead)'
 ```
 
 | Field | Meaning |
@@ -29,6 +29,9 @@ ioreg -lw0 -r -c AppleDisplay | rg 'DisplayProductID|DisplayBrightness(FirstUpda
 | `DisplayBrightnessCacheSaveState` | Latest save outcome; `accepted-native` / `unchanged-native` mean in-memory equality only |
 | `DisplayBrightnessCacheCurrent`, `CacheMaximum`, `CacheSequence` | Last record accepted by the native preference store in this boot |
 | `DisplayBrightnessInterfaceState` | `pending-hardware`, `hardware-ready` or terminal `hardware-unavailable` |
+| `DisplayBrightnessI2CActiveCount` | Active IOFramebuffer I2C services found during the latest validation; exactly one is required |
+| `DisplayBrightnessEndpointRefresh` | Latest decision: `keep`, `reprobe` or `retire` |
+| `DisplayBrightnessRequestRetries` | Automatic retries consumed by the current target; a different target resets the budget |
 | `DisplayBrightnessBootstrapState` | `published-from-hardware` indicates valid initial reading and publication |
 | `DisplayBrightnessStateSyncMessageResult` | Zero means message dispatch succeeded, not that UI refreshed |
 | `DisplayBrightnessDDCFrameWaitMicroseconds` | Latest DDC scope's wait to acquire the framebuffer gate |
@@ -40,7 +43,7 @@ Before initialization, requests are discarded. A cached declaration remains unwr
 
 ## Verify login gating and startup performance
 
-Version 1.0.0 is a local test build; no boot or startup-performance result is claimed. Keep the previously working kext available for comparison and rollback.
+Version 1.1.0 is a local test build; no boot, sleep/wake or startup-performance result is claimed. Keep the previously working kext available for comparison and rollback.
 
 | Root field | Meaning |
 | --- | --- |
@@ -54,13 +57,14 @@ Version 1.0.0 is a local test build; no boot or startup-performance result is cl
 1. On a cold boot that pauses at the login screen, confirm no initial DDC probe occurs before a completed local login. Cached interfaces may already exist; writes remain blocked. The driver must not need a timeout or user action to let macOS reach the login screen.
 2. Log in normally. Confirm `first-login-observed`, then per-display `published-from-hardware` and `hardware-ready`. The initial `DisplayBrightnessBootstrapHistory` entries' `startedUptimeNs` must be at or after `LoginObservedUptimeNs`, with no overlapping initial-read visits. The scheduler yields between visits rather than launching all displays simultaneously.
 3. Compare several cold boots against the previous build with the same login mode and attached displays. Record time to the login screen, time from completing login to a usable desktop, visible stutters and the DDC gate/read durations. The asynchronous design has no explicit boot-thread wait, but graphics-lock contention must be measured. Do not interpret the sum of DDC durations as added boot time or a successful build as evidence of zero overhead.
-4. Check automatic login separately, plus display arrival after login, unplug/replug while waiting at login, repeated lock/unlock and a monitor with DDC disabled. A failed monitor should cool down while others progress. Lock/unlock must not start a second first-login initialization. Sleep/wake needs its own test; a completed login does not prove wake readiness.
+4. Check automatic login separately, plus display arrival after login, unplug/replug while waiting at login, repeated lock/unlock and a monitor with DDC disabled. A failed monitor should cool down while others progress. Lock/unlock must not start a second first-login initialization.
+5. Test sleep/wake and USB-C reconnect separately. An initialized display must show `DisplayBrightnessEndpointRefresh=reprobe` when its active I2C path changes, followed by a fresh bootstrap read and `hardware-ready`. `DisplayBrightnessI2CActiveCount` must be `1` before transport. A completed login does not prove wake readiness.
 
 `notifier-unavailable` means the login or display-publication subscription failed and leaves DDC closed with no timed bypass. Missing or non-qualifying console state leaves the driver waiting; merely running WindowServer or loginwindow is insufficient. After login, a display that has not registered remains parked until its publication event, without polling. Once initial hardware probing starts, the existing bounded retry policy applies. These diagnostics neither restart services nor change brightness.
 
 ## Verify learning and restoration
 
-Native cached restoration was observed in the specified 0.0.32 sample; 1.0.0 preserves the record format. Existing 0.0.31 installations have no record from this feature, so expect a learning boot after installing the test kext. No service restart is part of this procedure.
+Native cached restoration was observed in the specified 0.0.32 sample; 1.1.0 preserves the record format. Existing 0.0.31 installations have no record from this feature, so expect a learning boot after installing the test kext. No service restart is part of this procedure.
 
 1. On the learning boot, confirm the loaded version, complete a local login, then wait until background DDC initialization has run. A first reason of `cache-missing` is expected. Confirm `published-from-hardware`, `hardware-ready` and `accepted-native` for each display. Record its `CacheCurrent` and `CacheMaximum`. Native sliders may still be absent on this boot.
 2. Allow normal macOS preference processing before a normal shutdown/reboot; the native setter schedules a notification after about two seconds. That interval and an `accepted-native` result do **not** prove a disk flush.

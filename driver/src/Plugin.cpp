@@ -12,6 +12,7 @@
 #include "ResponsiveRead.hpp"
 #include "VerifyTarget.hpp"
 #include "RetirePolicy.hpp"
+#include "ProviderPolicy.hpp"
 #include "ReadRecovery.hpp"
 #include "StateSync.hpp"
 #include "Bootstrap.hpp"
@@ -22,6 +23,7 @@
 #include "BootstrapSchedule.hpp"
 #include "VerifiedBrightness.hpp"
 #include "EndpointRequests.hpp"
+#include "EndpointRefresh.hpp"
 #include <IOKit/IOMessage.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
